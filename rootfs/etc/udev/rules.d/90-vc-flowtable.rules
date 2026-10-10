@@ -1,0 +1,1 @@
+SUBSYSTEM=="net", ACTION!="remove", NAME=="lan14|lan58|ge1|ge2|sfp1|sfp2", TAG+="systemd", ENV{SYSTEMD_WANTS}+="vc-flowtable.service"

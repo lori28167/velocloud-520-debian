@@ -1,0 +1,15 @@
+#!/bin/sh
+# After a kernel install (DKMS ran earlier in postinst.d): without the VeloCloud
+# igb module the LAN/WAN ports have no driver, so keep GRUB on the running
+# kernel until a kernel with the module is installed.
+ver="$1"
+[ -n "$ver" ] || exit 0
+[ -e /boot/grub/grubenv ] || exit 0
+if ls /lib/modules/"$ver"/updates/dkms/igb.ko* >/dev/null 2>&1; then
+	grub-editenv /boot/grub/grubenv unset saved_entry
+	exit 0
+fi
+cur=$(uname -r)
+uuid=$(grub-probe --target=fs_uuid /)
+grub-editenv /boot/grub/grubenv set saved_entry="gnulinux-advanced-$uuid>gnulinux-$cur-advanced-$uuid"
+echo "velocloud: WARNING: no VeloCloud igb module for $ver, GRUB keeps booting $cur" >&2

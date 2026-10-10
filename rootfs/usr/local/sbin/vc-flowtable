@@ -1,0 +1,27 @@
+#!/bin/sh
+# Software fast path: once a LAN<->WAN connection is established its packets
+# skip the forward chain.  The ports come from /etc/velocloud/flowtable.devices
+# (written by velocloud-apply).  Started by udev when a port appears and again
+# whenever nftables.service reloads the ruleset; waits up to 30 s for all the
+# ports, then adds the flowtable with the ones that exist.
+P=$(cat /etc/velocloud/flowtable.devices 2>/dev/null || echo "ge1 lan14 lan58")
+want=$(echo $P | wc -w)
+for i in $(seq 30); do
+	n=0; for d in $P; do [ -e /sys/class/net/$d ] && n=$((n + 1)); done
+	[ $n -eq $want ] && break
+	sleep 1
+done
+devs=""
+for d in $P; do [ -e /sys/class/net/$d ] && devs="$devs${devs:+, }$d"; done
+[ -n "$devs" ] || exit 0
+nft list flowtable inet filter ft >/dev/null 2>&1 && exit 0
+nft -f - <<NFT
+table inet filter {
+	flowtable ft {
+		hook ingress priority filter
+		devices = { $devs }
+	}
+}
+insert rule inet filter forward meta l4proto { tcp, udp } flow add @ft
+NFT
+echo "flowtable on: $devs"

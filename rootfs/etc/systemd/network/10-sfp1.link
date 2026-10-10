@@ -1,0 +1,6 @@
+# I350 port 0: SFP1
+[Match]
+Path=pci-0000:04:00.0
+
+[Link]
+Name=sfp1

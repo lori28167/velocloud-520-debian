@@ -1,0 +1,6 @@
+# I354 func 1 -> 88E6176 switch B: jacks LAN1-4
+[Match]
+Path=pci-0000:00:14.1
+
+[Link]
+Name=lan14

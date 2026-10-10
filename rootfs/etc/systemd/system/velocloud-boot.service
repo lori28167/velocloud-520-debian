@@ -1,0 +1,13 @@
+[Unit]
+Description=VeloCloud router: drop a configuration change that was never confirmed
+DefaultDependencies=no
+After=local-fs.target
+Before=systemd-networkd.service nftables.service dnsmasq.service hostapd.service network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/velocloud-apply --boot
+
+[Install]
+WantedBy=sysinit.target

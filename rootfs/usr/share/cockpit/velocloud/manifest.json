@@ -1,0 +1,13 @@
+{
+    "version": 0,
+    "requires": { "cockpit": "300" },
+    "menu": {
+        "index": {
+            "label": "Router",
+            "order": 2,
+            "keywords": [
+                { "matches": ["router", "network", "wifi", "wi-fi", "firewall", "lan", "wan", "dhcp", "pppoe", "port forwarding", "velocloud", "rete"] }
+            ]
+        }
+    }
+}

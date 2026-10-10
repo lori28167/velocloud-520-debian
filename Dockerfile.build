@@ -1,0 +1,6 @@
+FROM debian:trixie
+RUN sed -i 's/^Components: main$/Components: main contrib non-free non-free-firmware/' /etc/apt/sources.list.d/debian.sources && \
+    apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends \
+      linux-headers-amd64 linux-source build-essential dkms kmod xz-utils patch ca-certificates \
+      mmdebstrap grub-pc-bin grub2-common dosfstools e2fsprogs fdisk util-linux udev rsync cpio zstd >/dev/null && \
+    rm -rf /var/lib/apt/lists/*

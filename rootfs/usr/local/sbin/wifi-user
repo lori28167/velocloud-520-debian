@@ -1,0 +1,42 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# Local Wi-Fi users for FreeRADIUS, until Active Directory takes over.
+# Only the NT hash is stored (what PEAP-MSCHAPv2 needs), never the password.
+#   wifi-user add NAME      (asks for the password, or reads it from stdin)
+#   wifi-user del NAME
+#   wifi-user list
+set -eu
+F=/etc/freeradius/3.0/mods-config/files/authorize
+END='# velocloud wifi-user end'
+valid() { printf '%s' "$1" | grep -q -E '^[A-Za-z0-9._@-]{1,64}$' || { echo "invalid user name: $1"; exit 1; }; }
+[ -f "$F" ] || { echo "FreeRADIUS is not installed"; exit 1; }
+grep -q "^$END\$" "$F" ||
+	sed -i "1i # velocloud wifi-user: local Wi-Fi users (NT hash), managed by wifi-user\n$END" "$F"
+case "${1:-}" in
+add)
+	n=${2:?user name}; valid "$n"
+	if [ -t 0 ]; then
+		printf 'Password for %s: ' "$n" >&2; stty -echo; read -r p; stty echo; echo >&2
+		printf 'Again: ' >&2; stty -echo; read -r p2; stty echo; echo >&2
+		[ "$p" = "$p2" ] || { echo "passwords differ"; exit 1; }
+	else
+		read -r p
+	fi
+	[ ${#p} -ge 8 ] || { echo "the password needs at least 8 characters"; exit 1; }
+	h=$(smbencrypt "$p" 2>/dev/null | awk 'END { print $2 }')
+	unset p p2
+	printf '%s' "$h" | grep -q -E '^[0-9A-F]{32}$' || { echo "smbencrypt failed"; exit 1; }
+	sed -i "/^\"$n\" NT-Password := /d" "$F"
+	sed -i "s|^$END\$|\"$n\" NT-Password := 0x$h\n$END|" "$F"
+	systemctl try-restart freeradius
+	echo "user $n saved";;
+del)
+	n=${2:?user name}; valid "$n"
+	sed -i "/^\"$n\" NT-Password := /d" "$F"
+	systemctl try-restart freeradius
+	echo "user $n removed";;
+list)
+	sed -n 's/^"\([^"]*\)" NT-Password := .*/\1/p' "$F";;
+*)
+	echo "usage: wifi-user add|del NAME | list"; exit 1;;
+esac

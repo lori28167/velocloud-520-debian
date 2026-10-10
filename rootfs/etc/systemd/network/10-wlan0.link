@@ -1,0 +1,6 @@
+# QCA988x mini-PCIe Wi-Fi (slot on bus 02)
+[Match]
+Path=pci-0000:02:00.0
+
+[Link]
+Name=wlan0

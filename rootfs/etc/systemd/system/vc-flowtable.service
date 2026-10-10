@@ -1,0 +1,10 @@
+[Unit]
+Description=nftables flowtable (software fast path) for LAN/WAN
+Requires=nftables.service
+After=nftables.service
+PartOf=nftables.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/vc-flowtable

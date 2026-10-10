@@ -1,0 +1,8 @@
+# build output, extracted kernel sources, local test data
+out/
+ref/
+wifi/
+*.img
+*.img.xz
+*.qcow2
+__pycache__/

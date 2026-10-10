@@ -1,0 +1,901 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-2.0-only
+"""velocloud-apply: turns /etc/velocloud/router.json into the system
+configuration (systemd-networkd, dnsmasq, nftables, hostapd, pppd) and
+restarts only what changed.
+
+  velocloud-apply                          apply router.json
+  velocloud-apply --check FILE             validate FILE
+  velocloud-apply --set FILE [--rollback-after SECONDS]
+        install FILE as router.json and apply it; unless --confirm comes
+        within SECONDS, go back to the last confirmed configuration
+  velocloud-apply --confirm                keep the pending change
+  velocloud-apply --rollback               back to the last confirmed config
+  velocloud-apply --boot                   at boot: drop an unconfirmed change
+  velocloud-apply --render-only ROOT       write the files under ROOT only
+  velocloud-apply --defaults               print the default configuration
+
+Results are printed as JSON: {"ok": true, ...} or {"ok": false, "errors": [...]}.
+"""
+
+import copy
+import fcntl
+import glob
+import ipaddress
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+
+ETC = "/etc/velocloud"
+CONFIG = ETC + "/router.json"
+CONFIRMED = ETC + "/router.confirmed.json"
+PENDING = ETC + "/pending"
+LOCK = "/run/velocloud.lock"
+RADIUS_SECRET = "/etc/freeradius/3.0/velocloud-secret"
+
+PORTS = ["lan14", "lan58", "ge1", "ge2", "sfp1", "sfp2"]
+PORT_LABELS = {"lan14": "LAN1-4", "lan58": "LAN5-8", "ge1": "GE1", "ge2": "GE2",
+               "sfp1": "SFP1", "sfp2": "SFP2"}
+WLAN = "wlan0"
+
+DEFAULTS = {
+    "version": 1,
+    "hostname": "velocloud",
+    "ports": {"lan14": "lan", "lan58": "lan", "ge1": "wan", "ge2": "off",
+              "sfp1": "off", "sfp2": "off"},
+    "lan": {
+        "address": "10.11.0.1", "prefix": 24, "domain": "lan", "ipv6": True,
+        "dhcp": {"enabled": True, "start": "10.11.0.100", "end": "10.11.0.250",
+                 "lease_hours": 12, "static": []},
+    },
+    "wan": {
+        "mode": "dhcp", "vlan": 0, "mtu": 0, "ipv6": True,
+        "address": "", "prefix": 24, "gateway": "", "dns": [],
+        "pppoe_user": "", "pppoe_password": "",
+    },
+    "wifi": {
+        "enabled": False, "ssid": "VeloCloud", "band": "5", "channel": 36,
+        "width": 80, "country": "IT", "hidden": False,
+        "security": "enterprise", "psk": "", "org": "VeloCloud",
+    },
+    "firewall": {"wan_ping": True, "wan_ssh": False, "wan_web": False,
+                 "forwards": []},
+}
+
+
+class Invalid(Exception):
+    pass
+
+
+def merged(cfg):
+    """Fill in missing keys from DEFAULTS (new versions add settings)."""
+    def walk(d, base):
+        out = copy.deepcopy(base)
+        for k, v in d.items():
+            if isinstance(v, dict) and isinstance(base.get(k), dict):
+                out[k] = walk(v, base[k])
+            else:
+                out[k] = v
+        return out
+    return walk(cfg, DEFAULTS)
+
+
+# ---------------------------------------------------------------- validation
+
+def validate(cfg):
+    errs = []
+
+    def err(path, msg):
+        errs.append({"path": path, "msg": msg})
+
+    def ip4(path, s):
+        try:
+            return ipaddress.IPv4Address(str(s))
+        except ValueError:
+            err(path, "not a valid IPv4 address")
+            return None
+
+    def boolean(path, v):
+        if not isinstance(v, bool):
+            err(path, "must be true or false")
+
+    if not re.fullmatch(r"[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?", str(cfg["hostname"])):
+        err("hostname", "letters, digits and '-' only, up to 63 characters")
+
+    roles = cfg["ports"]
+    for p in PORTS:
+        if roles.get(p) not in ("lan", "wan", "off"):
+            err("ports." + p, "role must be lan, wan or off")
+    wans = [p for p in PORTS if roles.get(p) == "wan"]
+    if len(wans) != 1:
+        err("ports", "exactly one port must be the WAN")
+    if not [p for p in PORTS if roles.get(p) == "lan"]:
+        err("ports", "at least one port must be in the LAN")
+
+    lan = cfg["lan"]
+    lan_ip = ip4("lan.address", lan["address"])
+    lan_net = None
+    if not isinstance(lan["prefix"], int) or not 8 <= lan["prefix"] <= 30:
+        err("lan.prefix", "prefix must be between 8 and 30")
+    elif lan_ip:
+        lan_net = ipaddress.IPv4Network(f"{lan_ip}/{lan['prefix']}", strict=False)
+        if lan_ip in (lan_net.network_address, lan_net.broadcast_address):
+            err("lan.address", "the router needs a host address, not the network or broadcast address")
+        if not lan_ip.is_private:
+            err("lan.address", "use a private address range (10.x, 172.16-31.x, 192.168.x)")
+    if not re.fullmatch(r"[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?", str(lan["domain"])):
+        err("lan.domain", "lower-case letters, digits and '-' only")
+    boolean("lan.ipv6", lan["ipv6"])
+
+    dhcp = lan["dhcp"]
+    boolean("lan.dhcp.enabled", dhcp["enabled"])
+    if dhcp["enabled"]:
+        s = ip4("lan.dhcp.start", dhcp["start"])
+        e = ip4("lan.dhcp.end", dhcp["end"])
+        if s and e and lan_net:
+            if s not in lan_net or e not in lan_net:
+                err("lan.dhcp", "the DHCP range must be inside the LAN subnet")
+            elif int(s) > int(e):
+                err("lan.dhcp", "the range start must come before its end")
+            elif lan_ip and int(s) <= int(lan_ip) <= int(e):
+                err("lan.dhcp", "the range must not contain the router address")
+        if not isinstance(dhcp["lease_hours"], int) or not 1 <= dhcp["lease_hours"] <= 168:
+            err("lan.dhcp.lease_hours", "lease time must be 1-168 hours")
+    seen = set()
+    for i, h in enumerate(dhcp["static"]):
+        p = f"lan.dhcp.static.{i}"
+        if not re.fullmatch(r"([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}", str(h.get("mac", ""))):
+            err(p + ".mac", "MAC address must look like aa:bb:cc:dd:ee:ff")
+        a = ip4(p + ".ip", h.get("ip", ""))
+        if a and lan_net and (a not in lan_net or a == lan_ip):
+            err(p + ".ip", "the address must be in the LAN subnet and not the router's")
+        if a in seen:
+            err(p + ".ip", "address used twice")
+        seen.add(a)
+        if h.get("name") and not re.fullmatch(r"[a-zA-Z0-9-]{1,63}", h["name"]):
+            err(p + ".name", "letters, digits and '-' only")
+
+    wan = cfg["wan"]
+    if wan["mode"] not in ("dhcp", "static", "pppoe"):
+        err("wan.mode", "mode must be dhcp, static or pppoe")
+    if not isinstance(wan["vlan"], int) or not 0 <= wan["vlan"] <= 4094:
+        err("wan.vlan", "VLAN must be 0 (none) or 1-4094")
+    if not isinstance(wan["mtu"], int) or not (wan["mtu"] == 0 or 576 <= wan["mtu"] <= 9000):
+        err("wan.mtu", "MTU must be 0 (automatic) or 576-9000")
+    boolean("wan.ipv6", wan["ipv6"])
+    if wan["mode"] == "static":
+        a = ip4("wan.address", wan["address"])
+        g = ip4("wan.gateway", wan["gateway"])
+        if not isinstance(wan["prefix"], int) or not 1 <= wan["prefix"] <= 32:
+            err("wan.prefix", "prefix must be 1-32")
+        elif a:
+            net = ipaddress.IPv4Network(f"{a}/{wan['prefix']}", strict=False)
+            if g and g not in net:
+                err("wan.gateway", "the gateway must be inside the WAN subnet")
+            if lan_net and net.overlaps(lan_net):
+                err("wan.address", "the WAN subnet overlaps the LAN subnet")
+        if not wan["dns"]:
+            err("wan.dns", "give at least one DNS server")
+    for i, d in enumerate(wan["dns"]):
+        ip4(f"wan.dns.{i}", d)
+    if wan["mode"] == "pppoe":
+        if not wan["pppoe_user"]:
+            err("wan.pppoe_user", "PPPoE needs a user name")
+        for k in ("pppoe_user", "pppoe_password"):
+            if re.search(r"[\"\\\n]", str(wan[k])):
+                err("wan." + k, "quotes, backslashes and new lines are not allowed")
+
+    w = cfg["wifi"]
+    boolean("wifi.enabled", w["enabled"])
+    boolean("wifi.hidden", w["hidden"])
+    if not 1 <= len(str(w["ssid"]).encode()) <= 32 or "\n" in str(w["ssid"]):
+        err("wifi.ssid", "the network name needs 1-32 bytes")
+    if not re.fullmatch(r"[A-Z]{2}", str(w["country"])):
+        err("wifi.country", "two-letter country code, e.g. IT")
+    if w["band"] not in ("2", "5"):
+        err("wifi.band", "band must be 2 (2.4 GHz) or 5 (5 GHz)")
+    if w["width"] not in (20, 40, 80) or (w["band"] == "2" and w["width"] == 80):
+        err("wifi.width", "width must be 20 or 40 MHz (2.4 GHz) or 20/40/80 MHz (5 GHz)")
+    allowed = wifi_channels().get(w["band"])
+    if not isinstance(w["channel"], int):
+        err("wifi.channel", "channel must be a number")
+    elif allowed is not None and w["channel"] not in allowed:
+        err("wifi.channel", "channel not usable here: " + ", ".join(map(str, allowed)))
+    elif w["band"] == "5" and w["width"] == 80 and w["channel"] not in VHT80_CENTER:
+        err("wifi.channel", "no 80 MHz block for this channel")
+    if w["security"] not in ("enterprise", "psk"):
+        err("wifi.security", "security must be enterprise or psk")
+    if w["security"] == "psk" and not 8 <= len(str(w["psk"])) <= 63:
+        err("wifi.psk", "the password needs 8-63 characters")
+    if w["security"] == "psk" and "\n" in str(w["psk"]):
+        err("wifi.psk", "new lines are not allowed")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 ._-]{0,40}", str(w["org"])):
+        err("wifi.org", "letters, digits, spaces, '.', '_' and '-' only")
+
+    fw = cfg["firewall"]
+    for k in ("wan_ping", "wan_ssh", "wan_web"):
+        boolean("firewall." + k, fw[k])
+    used = {}
+    for i, f in enumerate(fw["forwards"]):
+        p = f"firewall.forwards.{i}"
+        if f.get("proto") not in ("tcp", "udp", "tcp+udp"):
+            err(p + ".proto", "protocol must be tcp, udp or tcp+udp")
+        rng = port_range(f.get("port"))
+        if not rng:
+            err(p + ".port", "port must be 1-65535 or a range like 8000-8010")
+        a = ip4(p + ".ip", f.get("ip", ""))
+        if a and lan_net and (a not in lan_net or a == lan_ip):
+            err(p + ".ip", "the destination must be a LAN device, not the router")
+        tp = f.get("to_port") or 0
+        if tp and (not isinstance(tp, int) or not 1 <= tp <= 65535):
+            err(p + ".to_port", "destination port must be 1-65535")
+        if tp and rng and rng[0] != rng[1]:
+            err(p + ".to_port", "a destination port only works with a single port")
+        if not isinstance(f.get("enabled", True), bool):
+            err(p + ".enabled", "must be true or false")
+        if not re.fullmatch(r"[A-Za-z0-9 ._-]{0,40}", str(f.get("name", ""))):
+            err(p + ".name", "letters, digits, spaces, '.', '_' and '-' only, up to 40")
+        if rng and f.get("enabled", True):
+            for proto in ("tcp", "udp"):
+                if proto in str(f.get("proto")):
+                    for port in range(rng[0], rng[1] + 1):
+                        if (proto, port) in used:
+                            err(p + ".port", f"{proto} {port} is already forwarded by rule {used[(proto, port)] + 1}")
+                            break
+                        used[(proto, port)] = i
+    return errs
+
+
+def port_range(v):
+    m = re.fullmatch(r"(\d{1,5})(?:-(\d{1,5}))?", str(v))
+    if not m:
+        return None
+    a = int(m.group(1))
+    b = int(m.group(2) or a)
+    return (a, b) if 1 <= a <= b <= 65535 else None
+
+
+# ---------------------------------------------------------------- Wi-Fi radio
+
+VHT80_CENTER = {c: 42 for c in (36, 40, 44, 48)}
+VHT80_CENTER.update({c: 58 for c in (52, 56, 60, 64)})
+VHT80_CENTER.update({c: 106 for c in (100, 104, 108, 112)})
+VHT80_CENTER.update({c: 122 for c in (116, 120, 124, 128)})
+VHT80_CENTER.update({c: 138 for c in (132, 136, 140, 144)})
+VHT80_CENTER.update({c: 155 for c in (149, 153, 157, 161)})
+HT40_PLUS_5G = {36, 44, 52, 60, 100, 108, 116, 124, 132, 140, 149, 157}
+
+
+def iw_phy_info():
+    try:
+        return subprocess.run(["iw", "phy"], capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+
+
+def wifi_channels():
+    """Channels the radio may use as an access point (no radar/no-IR)."""
+    out = {}
+    band = None
+    for line in iw_phy_info().splitlines():
+        m = re.match(r"\s*Band (\d):", line)
+        if m:
+            band = {"1": "2", "2": "5"}.get(m.group(1))
+            continue
+        m = re.match(r"\s*\* (\d+)(?:\.\d+)? MHz \[(\d+)\](.*)", line)
+        if m and band:
+            flags = m.group(3)
+            if "disabled" in flags or "radar" in flags.lower() or "no IR" in flags:
+                continue
+            out.setdefault(band, []).append(int(m.group(2)))
+    return out
+
+
+HT_FLAGS = [(0x0001, "[LDPC]"), (0x0020, "[SHORT-GI-20]"), (0x0040, "[SHORT-GI-40]"),
+            (0x0080, "[TX-STBC]"), (0x0800, "[MAX-AMSDU-7935]")]
+VHT_FLAGS = [(0x0010, "[RXLDPC]"), (0x0020, "[SHORT-GI-80]"), (0x0080, "[TX-STBC-2BY1]"),
+             (0x0800, "[SU-BEAMFORMER]"), (0x1000, "[SU-BEAMFORMEE]"),
+             (0x80000, "[MU-BEAMFORMER]"), (0x100000, "[MU-BEAMFORMEE]"),
+             (0x10000000, "[RX-ANTENNA-PATTERN]"), (0x20000000, "[TX-ANTENNA-PATTERN]")]
+
+
+def radio_caps(band):
+    """(ht_capab bits, vht_capab bits) of the radio for a band, from iw."""
+    ht = vht = None
+    cur = None
+    for line in iw_phy_info().splitlines():
+        m = re.match(r"\s*Band (\d):", line)
+        if m:
+            cur = {"1": "2", "2": "5"}.get(m.group(1))
+            continue
+        if cur != band:
+            continue
+        m = re.match(r"\s*Capabilities: (0x[0-9a-f]+)", line)
+        if m and ht is None:
+            ht = int(m.group(1), 16)
+        m = re.match(r"\s*VHT Capabilities \((0x[0-9a-f]+)\)", line)
+        if m:
+            vht = int(m.group(1), 16)
+    return ht, vht
+
+
+def ht_capab(band, channel, width):
+    ht, _ = radio_caps(band)
+    if ht is None:
+        ht = 0x19ef			# QCA988x
+    s = "".join(f for bit, f in HT_FLAGS if ht & bit)
+    rx = (ht >> 8) & 3
+    if rx:
+        s += ["", "[RX-STBC1]", "[RX-STBC12]", "[RX-STBC123]"][rx]
+    if width >= 40 and ht & 0x0002:
+        if band == "5":
+            s = ("[HT40+]" if channel in HT40_PLUS_5G else "[HT40-]") + s
+        else:
+            s = ("[HT40+]" if channel <= 7 else "[HT40-]") + s
+            if ht & 0x1000:
+                s += "[DSSS_CCK-40]"
+    return s
+
+
+def vht_capab():
+    _, v = radio_caps("5")
+    if v is None:
+        v = 0x338001b2			# QCA988x
+    s = ["", "[MAX-MPDU-7991]", "[MAX-MPDU-11454]", ""][v & 3]
+    s += "".join(f for bit, f in VHT_FLAGS if v & bit)
+    rx = (v >> 8) & 7
+    if rx:
+        s += f"[RX-STBC-{'1234'[:rx]}]"
+    s += f"[MAX-A-MPDU-LEN-EXP{(v >> 23) & 7}]"
+    return s
+
+
+# ---------------------------------------------------------------- rendering
+
+HEADER = "# generated by velocloud-apply from /etc/velocloud/router.json: edit that instead\n"
+NET = "/etc/systemd/network"
+
+
+def wan_names(cfg):
+    """(physical WAN port, L2 device carrying the WAN, L3 interface)."""
+    port = [p for p in PORTS if cfg["ports"][p] == "wan"][0]
+    l2 = f"{port}.{cfg['wan']['vlan']}" if cfg["wan"]["vlan"] else port
+    l3 = "ppp-wan" if cfg["wan"]["mode"] == "pppoe" else l2
+    return port, l2, l3
+
+
+def ini(sections):
+    out = HEADER
+    for name, items in sections:
+        out += f"\n[{name}]\n"
+        for k, v in items:
+            out += f"{k}={v}\n"
+    return out
+
+
+def render(cfg):
+    files = {}
+    port, l2, l3 = wan_names(cfg)
+    wan, lan, w = cfg["wan"], cfg["lan"], cfg["wifi"]
+    mtu = [("MTUBytes", wan["mtu"])] if wan["mtu"] else []
+
+    def wan_ip_sections(dev):
+        if wan["mode"] == "pppoe":
+            return [("Match", [("Name", dev)]),
+                    ("Network", [("LinkLocalAddressing", "no"), ("IPv6AcceptRA", "no")]),
+                    ("Link", [("RequiredForOnline", "carrier")] + mtu)]
+        net = [("IPv6AcceptRA", "yes" if wan["ipv6"] else "no")]
+        if not wan["ipv6"]:
+            net.append(("LinkLocalAddressing", "no"))
+        if wan["mode"] == "dhcp":
+            net.insert(0, ("DHCP", "yes" if wan["ipv6"] else "ipv4"))
+            secs = [("Match", [("Name", dev)]), ("Network", net),
+                    ("DHCPv4", [("UseHostname", "no")] + ([("UseDNS", "no")] if wan["dns"] else []))]
+            if wan["ipv6"]:
+                secs.append(("DHCPv6", [("UseDelegatedPrefix", "yes")] + ([("UseDNS", "no")] if wan["dns"] else [])))
+        else:
+            if wan["ipv6"]:
+                net.insert(0, ("DHCP", "ipv6"))
+            net[:0] = [("Address", f"{wan['address']}/{wan['prefix']}"), ("Gateway", wan["gateway"])]
+            secs = [("Match", [("Name", dev)]), ("Network", net)]
+        for d in wan["dns"]:
+            secs[1][1].append(("DNS", d))
+        secs.append(("Link", [("RequiredForOnline", "routable")] + mtu))
+        return secs
+
+    for p in PORTS:
+        role = cfg["ports"][p]
+        name = f"{NET}/30-vc-{p}.network"
+        if role == "lan":
+            files[name] = ini([("Match", [("Name", p)]), ("Network", [("Bridge", "br-lan")]),
+                               ("Link", [("RequiredForOnline", "no")])])
+        elif role == "off":
+            files[name] = ini([("Match", [("Name", p)]),
+                               ("Link", [("ActivationPolicy", "always-down"), ("RequiredForOnline", "no")])])
+        elif wan["vlan"]:
+            files[name] = ini([("Match", [("Name", p)]),
+                               ("Network", [("VLAN", l2), ("LinkLocalAddressing", "no"), ("IPv6AcceptRA", "no")]),
+                               ("Link", [("RequiredForOnline", "carrier")] + mtu)])
+            files[f"{NET}/25-vc-wan-vlan.netdev"] = ini([("NetDev", [("Name", l2), ("Kind", "vlan")]),
+                                                          ("VLAN", [("Id", wan["vlan"])])])
+            files[f"{NET}/31-vc-wan-vlan.network"] = ini(wan_ip_sections(l2))
+        else:
+            files[name] = ini(wan_ip_sections(p))
+
+    br = [("Address", f"{lan['address']}/{lan['prefix']}"), ("ConfigureWithoutCarrier", "yes")]
+    if lan["ipv6"]:
+        br += [("DHCPPrefixDelegation", "yes"), ("IPv6SendRA", "yes")]
+    else:
+        br += [("LinkLocalAddressing", "no"), ("IPv6SendRA", "no")]
+    files[f"{NET}/40-vc-br-lan.network"] = ini([("Match", [("Name", "br-lan")]), ("Network", br),
+                                                 ("Link", [("RequiredForOnline", "no")])])
+
+    # dnsmasq: DNS for the LAN (upstream = systemd-resolved), DHCP
+    net = ipaddress.IPv4Network(f"{lan['address']}/{lan['prefix']}", strict=False)
+    d = HEADER + f"""interface=br-lan
+except-interface=lo
+bind-dynamic
+no-resolv
+server=127.0.0.53
+domain-needed
+bogus-priv
+domain={lan['domain']}
+local=/{lan['domain']}/
+expand-hosts
+interface-name={cfg['hostname']}.{lan['domain']},br-lan
+interface-name={cfg['hostname']},br-lan
+cache-size=1000
+"""
+    if lan["dhcp"]["enabled"]:
+        dh = lan["dhcp"]
+        d += f"""dhcp-authoritative
+dhcp-range={dh['start']},{dh['end']},{net.netmask},{dh['lease_hours']}h
+dhcp-option=option:router,{lan['address']}
+dhcp-option=option:dns-server,{lan['address']}
+"""
+        for h in dh["static"]:
+            d += f"dhcp-host={h['mac'].lower()},{h['ip']}" + (f",{h['name']}" if h.get("name") else "") + "\n"
+    files["/etc/dnsmasq.d/velocloud.conf"] = d
+
+    # nftables
+    fw = cfg["firewall"]
+    inp = ["iifname $WAN udp dport 546 accept comment \"DHCPv6 client\""]
+    if fw["wan_ping"]:
+        inp.append("iifname $WAN icmp type echo-request accept")
+    if fw["wan_ssh"]:
+        inp.append("iifname $WAN tcp dport 22 accept comment \"SSH\"")
+    if fw["wan_web"]:
+        inp.append("iifname $WAN tcp dport { 443, 9090 } accept comment \"web interface\"")
+    dnat = []
+    for f in fw["forwards"]:
+        if not f.get("enabled", True):
+            continue
+        a, b = port_range(f["port"])
+        ports = f"{a}-{b}" if a != b else str(a)
+        to = f"{f['ip']}:{f['to_port']}" if f.get("to_port") else f["ip"]
+        protos = ["tcp", "udp"] if f["proto"] == "tcp+udp" else [f["proto"]]
+        for proto in protos:
+            dnat.append(f"iifname $WAN {proto} dport {ports} dnat to {to} comment \"{f.get('name', '')[:40]}\"")
+    mss = "\t\ttcp flags syn tcp option maxseg size set rt mtu\n" if wan["mode"] == "pppoe" or wan["mtu"] else ""
+    nft = f"""#!/usr/sbin/nft -f
+{HEADER}flush ruleset
+
+define WAN = "{l3}"
+define LAN = "br-lan"
+
+table inet filter {{
+	chain input {{
+		type filter hook input priority filter; policy drop;
+		ct state established,related accept
+		ct state invalid drop
+		iif lo accept
+		iifname $LAN accept
+		meta l4proto ipv6-icmp accept
+		icmp type != echo-request accept
+""" + "".join(f"\t\t{r}\n" for r in inp) + f"""	}}
+
+	chain forward {{
+		type filter hook forward priority filter; policy drop;
+{mss}		ct state established,related accept
+		ct state invalid drop
+		iifname $LAN oifname $WAN accept
+		ct status dnat accept
+		icmpv6 type {{ destination-unreachable, packet-too-big, time-exceeded, parameter-problem, echo-request }} accept
+	}}
+
+	chain output {{
+		type filter hook output priority filter; policy accept;
+	}}
+}}
+
+table ip nat {{
+	chain prerouting {{
+		type nat hook prerouting priority dstnat; policy accept;
+""" + "".join(f"\t\t{r}\n" for r in dnat) + """	}
+
+	chain postrouting {
+		type nat hook postrouting priority srcnat; policy accept;
+		oifname $WAN masquerade
+	}
+}
+"""
+    files["/etc/nftables.conf"] = nft
+    files[ETC + "/flowtable.devices"] = " ".join([port] + [p for p in PORTS if cfg["ports"][p] == "lan"]) + "\n"
+
+    # Wi-Fi
+    if w["enabled"]:
+        h = HEADER + f"""interface={WLAN}
+bridge=br-lan
+driver=nl80211
+ctrl_interface=/run/hostapd
+ctrl_interface_group=0
+ssid={w['ssid']}
+utf8_ssid=1
+ignore_broadcast_ssid={1 if w['hidden'] else 0}
+country_code={w['country']}
+ieee80211d=1
+channel={w['channel']}
+ieee80211n=1
+ht_capab={ht_capab(w['band'], w['channel'], w['width'])}
+wmm_enabled=1
+"""
+        if w["band"] == "5":
+            h += "hw_mode=a\nieee80211ac=1\n"
+            if w["width"] == 80:
+                h += f"vht_oper_chwidth=1\nvht_oper_centr_freq_seg0_idx={VHT80_CENTER[w['channel']]}\n"
+            else:
+                h += "vht_oper_chwidth=0\n"
+            h += f"vht_capab={vht_capab()}\n"
+        else:
+            h += "hw_mode=g\n"
+        h += "auth_algs=1\nwpa=2\nrsn_pairwise=CCMP\nieee80211w=1\n"
+        if w["security"] == "psk":
+            h += f"wpa_key_mgmt=WPA-PSK SAE\nsae_require_mfp=1\nwpa_passphrase={w['psk']}\n"
+        else:
+            secret = radius_secret()
+            h += f"""wpa_key_mgmt=WPA-EAP WPA-EAP-SHA256
+ieee8021x=1
+eapol_version=2
+eap_reauth_period=3600
+own_ip_addr=127.0.0.1
+nas_identifier={cfg['hostname']}
+auth_server_addr=127.0.0.1
+auth_server_port=1812
+auth_server_shared_secret={secret}
+acct_server_addr=127.0.0.1
+acct_server_port=1813
+acct_server_shared_secret={secret}
+"""
+        files["/etc/hostapd/hostapd.conf"] = h
+
+    # PPPoE
+    if wan["mode"] == "pppoe":
+        files["/etc/ppp/peers/velocloud-wan"] = HEADER + f"""plugin pppoe.so
+nic-{l2}
+ifname ppp-wan
+user "{wan['pppoe_user']}"
+noauth
+defaultroute
+persist
+maxfail 0
+holdoff 5
+lcp-echo-interval 15
+lcp-echo-failure 4
+mtu {wan['mtu'] or 1492}
+mru {wan['mtu'] or 1492}
+noipdefault
+hide-password
+""" + ("" if wan["dns"] else "usepeerdns\n")
+        sec = HEADER + f"\"{wan['pppoe_user']}\" * \"{wan['pppoe_password']}\" *\n"
+        files["/etc/ppp/chap-secrets"] = sec
+        files["/etc/ppp/pap-secrets"] = sec
+        # static DNS servers for the ppp ip-up hook (empty: the provider's)
+        files[ETC + "/wan-dns"] = " ".join(wan["dns"]) + "\n"
+
+    files["/etc/hostname"] = cfg["hostname"] + "\n"
+    # Wi-Fi regulatory domain from the first moment the radio driver loads
+    files["/etc/modprobe.d/cfg80211-regdom.conf"] = HEADER + f"options cfg80211 ieee80211_regdom={w['country']}\n"
+    return files
+
+
+def radius_secret():
+    try:
+        with open(RADIUS_SECRET) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+# ---------------------------------------------------------------- applying
+
+LEGACY = [f"{NET}/30-lan-ports.network", f"{NET}/40-br-lan.network", f"{NET}/50-wan.network",
+          "/etc/dnsmasq.d/lan.conf"]
+SECRET_FILES = ("/etc/ppp/chap-secrets", "/etc/ppp/pap-secrets", "/etc/hostapd/hostapd.conf")
+# removed when the configuration no longer needs them
+OPTIONAL = ("/etc/hostapd/hostapd.conf", "/etc/ppp/peers/velocloud-wan",
+            "/etc/ppp/chap-secrets", "/etc/ppp/pap-secrets", ETC + "/wan-dns")
+
+
+def write_files(files, root=""):
+    """Writes files that differ; removes stale generated ones.  Returns the
+    set of changed paths."""
+    changed = set()
+    managed = set(glob.glob(root + NET + "/*-vc-*")) | {root + p for p in LEGACY + list(OPTIONAL)}
+    for path, content in files.items():
+        full = root + path
+        try:
+            with open(full) as f:
+                if f.read() == content:
+                    managed.discard(full)
+                    continue
+        except OSError:
+            pass
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        tmp = full + ".vc-tmp"
+        with open(tmp, "w") as f:
+            f.write(content)
+        os.chmod(tmp, 0o600 if path in SECRET_FILES else 0o644)
+        os.replace(tmp, full)
+        managed.discard(full)
+        changed.add(path)
+    for full in managed:
+        if os.path.exists(full) and (full[len(root):] not in files):
+            os.remove(full)
+            changed.add(full[len(root):])
+    return changed
+
+
+def run(*cmd, check=False):
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if check and r.returncode:
+        raise RuntimeError(f"{' '.join(cmd)}: {r.stderr.strip()}")
+    return r
+
+
+def restart_services(cfg, old, changed):
+    done = []
+    port, l2, l3 = wan_names(cfg)
+    net_changed = {c for c in changed if c.startswith(NET)}
+    if net_changed:
+        # a port leaving the LAN must leave the bridge; an old VLAN must go
+        for p in PORTS:
+            if old and old["ports"].get(p) == "lan" and cfg["ports"][p] != "lan":
+                run("ip", "link", "set", p, "nomaster")
+        if old:
+            _, ol2, _ = wan_names(old)
+            if ol2 != l2 and "." in ol2:
+                run("ip", "link", "del", ol2)
+        run("networkctl", "reload", check=True)
+        # reconfigure only the links whose files changed, so the LAN stays up
+        devs = set()
+        for c in net_changed:
+            m = re.search(r"/30-vc-(\w+)\.network$", c)
+            if m:
+                devs.add(m.group(1))
+            elif "-vc-br-lan" in c or c in LEGACY:
+                devs.add("br-lan")
+            if "-vc-wan-vlan" in c or c.endswith("/50-wan.network"):
+                devs |= {port, l2}
+            if c.endswith("/30-lan-ports.network"):
+                devs |= {p for p in PORTS if cfg["ports"][p] == "lan"}
+        for dev in sorted(devs):
+            if os.path.exists(f"/sys/class/net/{dev}"):
+                run("networkctl", "reconfigure", dev)
+        done.append("network")
+    if "/etc/dnsmasq.d/velocloud.conf" in changed or "/etc/dnsmasq.d/lan.conf" in changed:
+        run("systemctl", "restart", "dnsmasq")
+        done.append("dnsmasq")
+    if "/etc/nftables.conf" in changed or ETC + "/flowtable.devices" in changed:
+        run("nft", "-c", "-f", "/etc/nftables.conf", check=True)
+        run("systemctl", "restart", "nftables")
+        run("systemctl", "restart", "vc-flowtable")
+        done.append("firewall")
+    if cfg["wifi"]["enabled"]:
+        if "/etc/hostapd/hostapd.conf" in changed or not service_active("hostapd"):
+            run("systemctl", "unmask", "hostapd")
+            run("systemctl", "enable", "hostapd")
+            if os.path.exists(f"/sys/class/net/{WLAN}"):
+                run("systemctl", "restart", "hostapd")
+            done.append("wifi")
+    elif service_active("hostapd") or service_enabled("hostapd"):
+        run("systemctl", "disable", "--now", "hostapd")
+        done.append("wifi")
+    # FreeRADIUS only runs for the Enterprise Wi-Fi
+    radius_on = cfg["wifi"]["enabled"] and cfg["wifi"]["security"] == "enterprise"
+    if radius_on and not service_active("freeradius"):
+        run("systemctl", "enable", "--now", "freeradius")
+        done.append("radius")
+    elif not radius_on and (service_active("freeradius") or service_enabled("freeradius")):
+        run("systemctl", "disable", "--now", "freeradius")
+        done.append("radius")
+    ppp = "ppp@velocloud-wan"
+    if cfg["wan"]["mode"] == "pppoe":
+        if changed & {"/etc/ppp/peers/velocloud-wan", "/etc/ppp/chap-secrets", ETC + "/wan-dns"} \
+                or not service_active(ppp):
+            run("systemctl", "enable", ppp)
+            run("systemctl", "restart", ppp)
+            done.append("pppoe")
+    elif service_active(ppp) or service_enabled(ppp):
+        run("systemctl", "disable", "--now", ppp)
+        done.append("pppoe")
+    if "/etc/modprobe.d/cfg80211-regdom.conf" in changed:
+        run("iw", "reg", "set", cfg["wifi"]["country"])
+    if "/etc/hostname" in changed:
+        run("hostnamectl", "set-hostname", cfg["hostname"])
+        done.append("hostname")
+    return done
+
+
+def service_active(unit):
+    return run("systemctl", "is-active", "--quiet", unit).returncode == 0
+
+
+def service_enabled(unit):
+    return run("systemctl", "is-enabled", "--quiet", unit).returncode == 0
+
+
+def ensure_radius(cfg):
+    """FreeRADIUS with our CA, server certificate and shared secret, set up
+    once by wifi-setup before hostapd.conf (which needs the secret) is made."""
+    if cfg["wifi"]["enabled"] and cfg["wifi"]["security"] == "enterprise" \
+            and not os.path.exists(RADIUS_SECRET):
+        run("/usr/local/sbin/wifi-setup", cfg["wifi"]["org"], check=True)
+
+
+def load(path):
+    with open(path) as f:
+        return merged(json.load(f))
+
+
+def save(cfg, path):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(cfg, f, indent=2)
+        f.write("\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def apply(cfg, old):
+    ensure_radius(cfg)
+    changed = write_files(render(cfg))
+    done = restart_services(cfg, old, changed)
+    return sorted(changed), done
+
+
+def schedule_rollback(seconds):
+    run("systemctl", "stop", "velocloud-rollback.timer")
+    run("systemctl", "reset-failed", "velocloud-rollback.service")
+    run("systemd-run", "--quiet", "--unit=velocloud-rollback", f"--on-active={seconds}s",
+        "--timer-property=AccuracySec=1s", "/usr/local/sbin/velocloud-apply", "--rollback", check=True)
+    deadline = int(time.time()) + seconds
+    with open(PENDING, "w") as f:
+        f.write(f"{deadline}\n")
+    return deadline
+
+
+def out(obj, code=0):
+    try:
+        print(json.dumps(obj), flush=True)
+    except BrokenPipeError:
+        pass			# the web interface went away: the work is done anyway
+    sys.exit(code)
+
+
+def main(argv):
+    if argv[:1] == ["--defaults"]:
+        out(DEFAULTS)
+    if argv[:1] == ["--check"] and len(argv) == 2:
+        try:
+            cfg = load(argv[1])
+        except (OSError, ValueError) as e:
+            out({"ok": False, "errors": [{"path": "", "msg": f"cannot read: {e}"}]}, 1)
+        errs = validate(cfg)
+        out({"ok": not errs, "errors": errs}, 1 if errs else 0)
+    if argv[:1] == ["--render-only"] and len(argv) == 2:
+        cfg = load(CONFIG) if os.path.exists(CONFIG) else merged({})
+        errs = validate(cfg)
+        if errs:
+            out({"ok": False, "errors": errs}, 1)
+        out({"ok": True, "changed": sorted(write_files(render(cfg), argv[1].rstrip("/")))})
+
+    os.makedirs(ETC, exist_ok=True)
+    os.makedirs("/run/velocloud", exist_ok=True)
+    lock = open(LOCK, "w")
+    fcntl.flock(lock, fcntl.LOCK_EX)
+
+    if not os.path.exists(CONFIG):
+        save(merged({}), CONFIG)
+    if not os.path.exists(CONFIRMED):
+        shutil.copy(CONFIG, CONFIRMED)
+
+    if argv[:1] == ["--confirm"]:
+        run("systemctl", "stop", "velocloud-rollback.timer")
+        shutil.copy(CONFIG, CONFIRMED)
+        if os.path.exists(PENDING):
+            os.remove(PENDING)
+        out({"ok": True, "confirmed": True})
+
+    if argv[:1] in (["--rollback"], ["--boot"]):
+        if argv[0] == "--boot" and not os.path.exists(PENDING):
+            out({"ok": True, "rolled_back": False})
+        run("systemctl", "stop", "velocloud-rollback.timer")
+        old = load(CONFIG)
+        shutil.copy(CONFIRMED, CONFIG)
+        if os.path.exists(PENDING):
+            os.remove(PENDING)
+        cfg = load(CONFIG)
+        if argv[0] == "--boot":
+            changed = write_files(render(cfg))
+            out({"ok": True, "rolled_back": True, "changed": sorted(changed)})
+        changed, done = apply(cfg, old)
+        out({"ok": True, "rolled_back": True, "changed": changed, "restarted": done})
+
+    seconds = 0
+    if argv[:1] == ["--set"] and len(argv) in (2, 4):
+        if len(argv) == 4:
+            if argv[2] != "--rollback-after" or not argv[3].isdigit():
+                out({"ok": False, "errors": [{"path": "", "msg": "usage: --set FILE [--rollback-after SECONDS]"}]}, 2)
+            seconds = int(argv[3])
+        try:
+            new = load(argv[1])
+        except (OSError, ValueError) as e:
+            out({"ok": False, "errors": [{"path": "", "msg": f"cannot read: {e}"}]}, 1)
+        errs = validate(new)
+        if errs:
+            out({"ok": False, "errors": errs}, 1)
+        old = load(CONFIG)
+        if not os.path.exists(PENDING):
+            shutil.copy(CONFIG, CONFIRMED)
+        save(new, CONFIG)
+        cfg = new
+    elif not argv:
+        cfg = load(CONFIG)
+        errs = validate(cfg)
+        if errs:
+            out({"ok": False, "errors": errs}, 1)
+        old = None
+    else:
+        print(__doc__, file=sys.stderr)
+        sys.exit(2)
+
+    # The web interface can lose its connection while the network is being
+    # reconfigured (new LAN address...): finish regardless, in our own
+    # session, with the rollback timer already armed.
+    for sig in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT, signal.SIGPIPE):
+        signal.signal(sig, signal.SIG_IGN)
+    try:
+        os.setsid()
+    except OSError:
+        pass
+    deadline = schedule_rollback(seconds) if seconds else None
+    try:
+        changed, done = apply(cfg, old)
+    except (RuntimeError, OSError) as e:
+        # could not apply: go straight back to the last working configuration
+        run("systemctl", "stop", "velocloud-rollback.timer")
+        shutil.copy(CONFIRMED, CONFIG)
+        if os.path.exists(PENDING):
+            os.remove(PENDING)
+        try:
+            apply(load(CONFIG), cfg)
+        finally:
+            out({"ok": False, "errors": [{"path": "", "msg": f"apply failed, previous configuration restored: {e}"}]}, 1)
+    result = {"ok": True, "changed": changed, "restarted": done}
+    if seconds:
+        result["pending_until"] = deadline
+    elif argv[:1] == ["--set"]:
+        run("systemctl", "stop", "velocloud-rollback.timer")
+        shutil.copy(CONFIG, CONFIRMED)
+        if os.path.exists(PENDING):
+            os.remove(PENDING)
+    out(result)
+
+
+if __name__ == "__main__":
+    main(sys.argv[1:])

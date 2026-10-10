@@ -1,0 +1,57 @@
+--- a/Makefile	2026-10-10 14:08:28.259466437 +0200
++++ b/Makefile	2026-10-10 14:11:57.828737934 +0200
+@@ -8,4 +8,4 @@
+ 
+ igb-y := igb_main.o igb_ethtool.o e1000_82575.o \
+ 	 e1000_mac.o e1000_nvm.o e1000_phy.o e1000_mbx.o \
+-	 e1000_i210.o igb_ptp.o igb_hwmon.o igb_vc.o
++	 e1000_i210.o igb_ptp.o igb_hwmon.o igb_vc.o igb_vc_board.o
+--- a/igb.h	2026-10-10 14:08:28.260338429 +0200
++++ b/igb.h	2026-10-10 14:11:57.830046774 +0200
+@@ -721,6 +721,9 @@
+ int igb_open(struct net_device *netdev);
+ int igb_vc_mii_register(struct igb_adapter *adapter);
+ void igb_vc_mii_unregister(struct igb_adapter *adapter);
++int igb_vc_board_init(void);
++void igb_vc_board_exit(void);
++void igb_vc_switch_up(struct igb_adapter *adapter);
+ int igb_close(struct net_device *netdev);
+ int igb_up(struct igb_adapter *);
+ void igb_down(struct igb_adapter *);
+--- a/igb_main.c	2026-10-10 14:08:28.260919263 +0200
++++ b/igb_main.c	2026-10-10 14:12:10.032032450 +0200
+@@ -633,6 +633,9 @@
+ 	pr_info("%s\n", igb_driver_string);
+ 	pr_info("%s\n", igb_copyright);
+ 
++	/* VeloCloud edge5x0: WAN MDIO bus, PHY reset, logo LED (no-op elsewhere) */
++	igb_vc_board_init();
++
+ #ifdef CONFIG_IGB_DCA
+ 	dca_register_notify(&dca_notifier);
+ #endif
+@@ -641,6 +644,8 @@
+ 	if (ret)
+ 		dca_unregister_notify(&dca_notifier);
+ #endif
++	if (ret)
++		igb_vc_board_exit();
+ 	return ret;
+ }
+ 
+@@ -658,6 +663,7 @@
+ 	dca_unregister_notify(&dca_notifier);
+ #endif
+ 	pci_unregister_driver(&igb_driver);
++	igb_vc_board_exit();
+ }
+ 
+ module_exit(igb_exit_module);
+@@ -3521,6 +3527,7 @@
+ 
+ 	/* VeloCloud edge5x0: export the switch MDIO bus (no-op elsewhere) */
+ 	igb_vc_mii_register(adapter);
++	igb_vc_switch_up(adapter);
+ 
+ 	/* carrier off reporting is important to ethtool even BEFORE open */
+ 	netif_carrier_off(netdev);

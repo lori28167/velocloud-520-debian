@@ -1,0 +1,6 @@
+# hostapd puts wlan0 into br-lan itself (AP mode first)
+[Match]
+Name=wlan0
+
+[Link]
+Unmanaged=yes

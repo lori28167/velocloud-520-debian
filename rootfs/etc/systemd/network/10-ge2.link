@@ -1,0 +1,6 @@
+# I354 func 3 -> 88E1514: jack GE2
+[Match]
+Path=pci-0000:00:14.3
+
+[Link]
+Name=ge2

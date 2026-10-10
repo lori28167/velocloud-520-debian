@@ -1,0 +1,36 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# Copy the running system (booted from a USB stick) to the VeloCloud's
+# internal disk ("Generic Ultra HS-COMBO"), with its own filesystem UUID so
+# the stick and the internal disk never get mixed up.
+set -eu
+T=$(ls /dev/disk/by-id/usb-Generic_Ultra_HS-COMBO_*-0:0 2>/dev/null | head -1)
+[ -n "$T" ] || { echo "internal disk (Generic Ultra HS-COMBO) not found"; exit 1; }
+T=$(readlink -f "$T")
+ROOTDEV=$(findmnt -n -o SOURCE /)
+case "$ROOTDEV" in "$T"*) echo "the running system is already on $T"; exit 1;; esac
+echo "Target: $T ($(lsblk -dn -o SIZE,MODEL "$T")), running from $ROOTDEV"
+echo "EVERYTHING ON $T WILL BE ERASED.  Type YES to continue:"
+read -r a; [ "$a" = YES ] || exit 1
+
+umount "$T"?* 2>/dev/null || true
+wipefs -a -q "$T"
+echo 'label: dos
+start=2048, type=83, bootable' | sfdisk -q "$T"
+blockdev --rereadpt "$T" 2>/dev/null || true; udevadm settle
+P="${T}1"
+mkfs.ext4 -q -F -L vc-root "$P"
+M=$(mktemp -d)
+mount -o noatime "$P" "$M"
+echo "copying the system..."
+rsync -aHAXx --info=progress2 --exclude=/lost+found --exclude='/tmp/*' --exclude='/var/tmp/*' / "$M"/
+U=$(blkid -s UUID -o value "$P")
+echo "UUID=$U / ext4 noatime,errors=remount-ro 0 1" > "$M"/etc/fstab
+for d in dev proc sys run; do mount --bind /$d "$M"/$d; done
+chroot "$M" grub-install --target=i386-pc "$T"
+chroot "$M" grub-editenv /boot/grub/grubenv unset saved_entry
+chroot "$M" update-grub
+chroot "$M" update-initramfs -u -k all
+for d in run sys proc dev; do umount "$M"/$d; done
+umount "$M"; rmdir "$M"
+echo "done: power off, remove the stick, power on."
