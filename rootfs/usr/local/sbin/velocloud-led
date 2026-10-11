@@ -1,0 +1,98 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-only
+# Front logo LED of the VeloCloud: colour and night-time switch-off, as set in
+# /etc/velocloud/router.json ("led") and rendered by velocloud-apply into
+# /etc/velocloud/led.env and velocloud-led.timer.
+#   velocloud-led auto            on or off for the time of day (boot, timer)
+#   velocloud-led now             the same, without waiting (velocloud-apply)
+#   velocloud-led on | off        by hand, until the next timer event
+#   velocloud-led color NAME | R G B
+#                                 set and keep the colour (0-255 each); names:
+#                                 red green blue white yellow orange cyan purple
+#   velocloud-led preview R G B   show a colour without saving it (web page)
+L=/sys/class/leds
+COLOR="0 255 0" NIGHT_OFF=0 OFF_AT=22:00 ON_AT=08:00
+[ -r /etc/velocloud/led.env ] && . /etc/velocloud/led.env
+
+led() { echo "$L/velocloud:$1:logo/brightness"; }
+
+show() {	# R G B
+	for c in red green blue; do echo "$1" > "$(led $c)"; shift; done
+}
+
+minutes() {	# HH:MM -> minutes since midnight
+	h=${1%:*} m=${1#*:}
+	echo $(( ${h#0} * 60 + ${m#0} ))
+}
+
+night() {
+	[ "$NIGHT_OFF" = 1 ] || return 1
+	now=$(minutes "$(date +%H:%M)") off=$(minutes "$OFF_AT") on=$(minutes "$ON_AT")
+	if [ "$off" -gt "$on" ]; then
+		[ "$now" -ge "$off" ] || [ "$now" -lt "$on" ]
+	else
+		[ "$now" -ge "$off" ] && [ "$now" -lt "$on" ]
+	fi
+}
+
+rgb() {		# NAME or R G B -> "R G B", or nothing if invalid
+	case "${1:-}" in
+	red)	set -- 255 0 0 ;;
+	green)	set -- 0 255 0 ;;
+	blue)	set -- 0 0 255 ;;
+	white)	set -- 255 255 255 ;;
+	yellow)	set -- 255 140 0 ;;
+	orange)	set -- 255 50 0 ;;
+	cyan)	set -- 0 255 255 ;;
+	purple|magenta) set -- 255 0 255 ;;
+	esac
+	[ $# -eq 3 ] || return
+	for v in "$@"; do
+		case "$v" in ''|*[!0-9]*) return ;; esac
+		[ "$v" -le 255 ] || return
+	done
+	echo "$1 $2 $3"
+}
+
+usage() { sed -n '6,14s/^# \{0,1\}//p' "$0" >&2; exit 2; }
+
+cmd=${1:-auto}
+case "$cmd" in
+auto)	# at boot the LED appears when the igb module loads: wait for it
+	for i in $(seq 60); do [ -e "$(led blue)" ] && break; sleep 1; done
+	sleep 2 ;;	# let the driver finish its own start-up colour
+esac
+[ -e "$(led blue)" ] || { [ "$cmd" = now ] && exit 0; echo "logo LED not found" >&2; exit 1; }
+
+case "$cmd" in
+auto|now)
+	if night; then show 0 0 0; else show $COLOR; fi ;;
+on)	show $COLOR ;;
+off)	show 0 0 0 ;;
+preview)
+	shift; c=$(rgb "$@"); [ -n "$c" ] || usage
+	show $c ;;
+color)
+	shift; c=$(rgb "$@"); [ -n "$c" ] || usage
+	hex=$(printf '#%02x%02x%02x' $c)
+	# a colour change cannot cut anyone off: keep it in the running and in
+	# the confirmed configuration, then let velocloud-apply render it
+	python3 - "$hex" <<'EOF'
+import json, os, sys
+for p in ("/etc/velocloud/router.json", "/etc/velocloud/router.confirmed.json"):
+    try:
+        with open(p) as f:
+            c = json.load(f)
+    except (OSError, ValueError):
+        continue
+    c.setdefault("led", {})["color"] = sys.argv[1]
+    with open(p + ".tmp", "w") as f:
+        json.dump(c, f, indent=2)
+        f.write("\n")
+    os.chmod(p + ".tmp", 0o600)
+    os.replace(p + ".tmp", p)
+EOF
+	/usr/local/sbin/velocloud-apply >/dev/null || exit 1
+	if night; then echo "colour saved; the LED stays off until $ON_AT (velocloud-led on shows it now)"; fi ;;
+*)	usage ;;
+esac

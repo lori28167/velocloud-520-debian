@@ -162,3 +162,9 @@ button.vc-btn:disabled { opacity: 0.5; cursor: default; }
 }
 .vc-grow { flex: 1; }
 .vc-right { text-align: right; }
+
+/* LED tab */
+.vc-color { width: 52px; height: 34px; padding: 2px; border: 1px solid var(--border); border-radius: 4px; background: var(--input); cursor: pointer; }
+.vc-swatch { width: 28px; height: 28px; border-radius: 50%; border: 2px solid var(--border); padding: 0; cursor: pointer; }
+.vc-swatch.active { outline: 2px solid var(--accent); outline-offset: 2px; }
+.vc-dot { display: inline-block; width: 16px; height: 16px; border-radius: 50%; border: 1px solid var(--border); }

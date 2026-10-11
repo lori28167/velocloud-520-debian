@@ -87,7 +87,7 @@ cp "$R/etc/velocloud/router.json" "$R/etc/velocloud/router.confirmed.json"
 chmod 600 "$R"/etc/velocloud/router*.json
 chroot "$R" /usr/local/sbin/velocloud-apply --render-only /
 chroot "$R" systemctl enable systemd-networkd systemd-resolved systemd-timesyncd nftables dnsmasq \
-	vc-ssh-hostkeys ssh irqbalance velocloud-boot cockpit.socket
+	vc-ssh-hostkeys ssh irqbalance velocloud-boot cockpit.socket velocloud-led
 # hostapd and FreeRADIUS are switched on by velocloud-apply when the Wi-Fi needs them
 chroot "$R" systemctl disable freeradius
 chroot "$R" systemctl mask hostapd

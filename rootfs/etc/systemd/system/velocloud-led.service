@@ -1,0 +1,9 @@
+[Unit]
+Description=Logo LED: colour and night switch-off from router.json
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/velocloud-led auto
+
+[Install]
+WantedBy=multi-user.target

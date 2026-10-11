@@ -193,6 +193,24 @@ const IT = {
     "good": "buono",
     "weak": "debole",
     "Save changes first, then add users.": "Applica prima le modifiche, poi aggiungi gli utenti.",
+    "Front LED": "LED frontale",
+    "Colour": "Colore",
+    "Now showing": "Adesso mostra",
+    "Always off": "Sempre spento",
+    "The LED shows the colour while you choose; Apply keeps it.": "Il LED mostra il colore mentre scegli; Applica lo mantiene.",
+    "Turn off at night": "Spegni di notte",
+    "Off at": "Spento alle",
+    "On again at": "Riacceso alle",
+    "The logo LED was not found (it needs the velocloud-igb driver on a VeloCloud Edge 520).":
+        "Il LED del logo non è stato trovato (serve il driver velocloud-igb su un VeloCloud Edge 520).",
+    "green": "verde",
+    "cyan": "azzurro",
+    "blue": "blu",
+    "purple": "viola",
+    "red": "rosso",
+    "orange": "arancione",
+    "yellow": "giallo",
+    "white": "bianco",
     // messages from velocloud-apply
     "exactly one port must be the WAN": "una e una sola porta deve essere la WAN",
     "at least one port must be in the LAN": "almeno una porta deve essere nella LAN",
@@ -239,6 +257,9 @@ const IT = {
     "letters, digits, spaces, '.', '_' and '-' only, up to 40": "solo lettere, cifre, spazi, '.', '_' e '-', fino a 40",
     "invalid user name": "nome utente non valido",
     "the password needs at least 8 characters": "la password deve avere almeno 8 caratteri",
+    "colour must look like #00ff00": "il colore deve avere la forma #00ff00",
+    "time must look like 22:00": "l'orario deve avere la forma 22:00",
+    "the LED must come back on at a different time": "il LED deve riaccendersi a un orario diverso",
 };
 const IT_PATTERNS = [
     [/^channel not usable here: (.*)$/, "canale non utilizzabile qui: $1"],
@@ -366,14 +387,22 @@ function run(args, input) {
     });
 }
 
+// settings added by newer versions are missing from an older router.json:
+// fill them in from the defaults, as velocloud-apply does
+function withDefaults(def, cfg) {
+    const out = clone(def);
+    for (const [k, v] of Object.entries(cfg || {}))
+        out[k] = v && typeof v === "object" && !Array.isArray(v) && def[k] && typeof def[k] === "object" && !Array.isArray(def[k])
+            ? withDefaults(def[k], v) : v;
+    return out;
+}
+
 async function loadConfig() {
-    let cfg = await cockpit.file(CONFIG, { syntax: JSON, superuser: "require" }).read();
-    if (!cfg) {
-        const r = await run([APPLY, "--defaults"]);
-        cfg = JSON.parse(r.out);
-    }
-    S.saved = cfg;
-    S.cfg = clone(cfg);
+    const cfg = await cockpit.file(CONFIG, { syntax: JSON, superuser: "require" }).read();
+    const r = await run([APPLY, "--defaults"]);
+    const merged = withDefaults(JSON.parse(r.out), cfg);
+    S.saved = merged;
+    S.cfg = clone(merged);
 }
 
 async function pollStatus() {
@@ -577,7 +606,7 @@ function renderBanner() {
 }
 
 function renderTabs() {
-    const tabs = [["status", _("Status")], ["network", _("Network")], ["wifi", _("Wi-Fi")], ["firewall", _("Firewall")]];
+    const tabs = [["status", _("Status")], ["network", _("Network")], ["wifi", _("Wi-Fi")], ["firewall", _("Firewall")], ["led", "LED"]];
     R.tabs.replaceChildren(h("div", { class: "vc-tabs" }, tabs.map(([id, label]) =>
         h("button", {
             class: S.tab === id ? "active" : "",
@@ -587,7 +616,7 @@ function renderTabs() {
 
 function renderBody() {
     if (!R.body) return;
-    const view = { status: viewStatus, network: viewNetwork, wifi: viewWifi, firewall: viewFirewall }[S.tab];
+    const view = { status: viewStatus, network: viewNetwork, wifi: viewWifi, firewall: viewFirewall, led: viewLed }[S.tab];
     // keep the focused field focused when a form is redrawn
     const focus = document.activeElement && document.activeElement.dataset ? document.activeElement.dataset.key : null;
     R.body.replaceChildren(view());
@@ -610,7 +639,7 @@ function renderBar() {
     if (S.busy) text = _("Applying…");
     R.bar.replaceChildren(h("div", { class: "vc-bar" },
         h("div", { class: "vc-bar-text" }, text),
-        h("button", { class: "vc-btn secondary", disabled: S.busy, onclick: () => { S.cfg = clone(S.saved); S.errors = []; renderAll() } }, _("Discard")),
+        h("button", { class: "vc-btn secondary", disabled: S.busy, onclick: () => { S.cfg = clone(S.saved); S.errors = []; run([LEDCMD, "now"]).catch(() => null); renderAll() } }, _("Discard")),
         h("button", { class: "vc-btn", disabled: S.busy, onclick: applyChanges }, _("Apply"))));
 }
 
@@ -930,6 +959,65 @@ function viewConnect() {
             ]),
             h("p", { class: "vc-help" }, _("Install the CA certificate on the device (Android: Settings, Security, Install a certificate, Wi-Fi certificate). iPhone, Mac and Windows show the certificate on the first connection: check its fingerprint.")),
         ] : h("p", { class: "vc-help" }, _("The certificate is created when the Enterprise Wi-Fi is first applied.")));
+}
+
+/* ---------------- LED */
+
+const LEDCMD = "/usr/local/sbin/velocloud-led";
+const SWATCHES = [["green", "#00ff00"], ["cyan", "#00ffff"], ["blue", "#0000ff"], ["purple", "#ff00ff"],
+    ["red", "#ff0000"], ["orange", "#ff3200"], ["yellow", "#ff8c00"], ["white", "#ffffff"]];
+let previewTimer = null;
+
+function previewLed(hex) {
+    // show the colour on the box right away, without saving it
+    clearTimeout(previewTimer);
+    previewTimer = setTimeout(() => {
+        const rgb = [1, 3, 5].map(i => String(parseInt(hex.slice(i, i + 2), 16)));
+        run([LEDCMD, "preview", ...rgb]).catch(() => null);
+    }, 120);
+}
+
+function setLedColor(hex) {
+    S.cfg.led.color = hex.toLowerCase();
+    previewLed(hex);
+    changed();
+}
+
+function viewLed() {
+    const led = S.cfg.led;
+    const st = S.status && S.status.led;
+    const picker = h("input", { type: "color", value: led.color, class: "vc-color", "aria-label": _("Colour") });
+    picker.addEventListener("input", () => setLedColor(picker.value));
+    const swatch = (name, hex) => {
+        const b = h("button", {
+            class: "vc-swatch" + (led.color.toLowerCase() === hex ? " active" : ""),
+            title: _(name), "aria-label": _(name),
+            onclick: () => { setLedColor(hex); renderBody() },
+        });
+        b.style.backgroundColor = hex;		// CSSOM: allowed by Cockpit's CSP
+        return b;
+    };
+    let now = null;
+    if (st && st.present) {
+        now = h("span", { class: "vc-dot" });
+        now.style.backgroundColor = st.color;
+    }
+    return h("div", {},
+        st && !st.present ? h("div", { class: "vc-alert info" }, _("The logo LED was not found (it needs the velocloud-igb driver on a VeloCloud Edge 520).")) : null,
+        h("div", { class: "vc-card" },
+            h("h2", {}, _("Front LED")),
+            h("div", { class: "vc-form" },
+                row(_("Colour"), "led.color", h("div", { class: "vc-inline" },
+                    picker,
+                    SWATCHES.map(([name, hex]) => swatch(name, hex)),
+                    h("button", { class: "vc-btn link", onclick: () => { setLedColor("#000000"); renderBody() } }, _("Always off"))),
+                _("The LED shows the colour while you choose; Apply keeps it.")),
+                now ? row(_("Now showing"), null, h("div", { class: "vc-inline" }, now, h("span", { class: "vc-mono" }, st.color))) : null,
+                row("", "led.night_off", checkbox("led.night_off", _("Turn off at night"), true)),
+                led.night_off ? [
+                    row(_("Off at"), "led.off_at", input("led.off_at", { type: "time" })),
+                    row(_("On again at"), "led.on_at", input("led.on_at", { type: "time" })),
+                ] : null)));
 }
 
 /* ---------------- firewall */

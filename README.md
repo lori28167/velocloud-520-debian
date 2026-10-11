@@ -22,7 +22,7 @@ firewall. Underneath it is plain Debian: `apt`, systemd, DKMS, nothing forked.
 
 *The status page, here in the QEMU test VM: it has no switches, so the LAN jacks show
 "unknown". More: [network](docs/screenshots/network.png) ([Italian](docs/screenshots/network-it.png)),
-[Wi-Fi](docs/screenshots/wifi.png), [firewall](docs/screenshots/firewall.png).*
+[Wi-Fi](docs/screenshots/wifi.png), [firewall](docs/screenshots/firewall.png), [LED](docs/screenshots/led.png).*
 
 ## What you get
 
@@ -36,7 +36,8 @@ firewall. Underneath it is plain Debian: `apt`, systemd, DKMS, nothing forked.
     range and fixed addresses;
   - Wi-Fi: 2.4 or 5 GHz, channel and width, WPA2/WPA3 with a password or
     WPA2/WPA3-Enterprise with one account per person;
-  - firewall: access from the Internet and port forwarding.
+  - firewall: access from the Internet and port forwarding;
+  - LED: colour of the front logo (previewed live on the box) and switch-off at night.
 - **Safe changes.** Every change is applied with a countdown: if you do not confirm
   it within 90 seconds (because the new LAN address or a wrong port role cut you
   off), the router goes back to the previous settings by itself. A change that was
@@ -46,7 +47,7 @@ firewall. Underneath it is plain Debian: `apt`, systemd, DKMS, nothing forked.
   Active Directory domain later.
 - **Firewall** with nftables, NAT, port forwarding and a software fast path
   (flowtable) for established connections.
-- The **front logo RGB LED** as standard Linux LEDs, the Atom **hardware watchdog**
+- The **front logo RGB LED** in any colour, optionally off at night, the Atom **hardware watchdog**
   driven by systemd, the **serial console** on the mini-USB jack (GRUB menu included).
 - **Kernel updates** stay safe: the network driver is rebuilt by DKMS, and if that
   fails GRUB keeps booting the previous kernel, so the ports never disappear.
@@ -91,6 +92,8 @@ velocloud-apply --confirm                         # keep it
 velocloud-apply --rollback                        # go back now
 velocloud-status                                  # live state as JSON
 wifi-user add NAME | del NAME | list              # Wi-Fi Enterprise accounts
+velocloud-led color purple | color 0 128 255      # logo colour, kept in router.json
+velocloud-led on | off                            # by hand, until the next night switch
 ```
 
 Do not edit the files `velocloud-apply` generates (systemd-networkd `*-vc-*` files,
@@ -100,8 +103,9 @@ the PPPoE peer): they are rewritten from `router.json`.
 **SSH** accepts keys only. Add yours in Cockpit (*Accounts* → root → *Authorized
 public SSH keys*) or in `/root/.ssh/authorized_keys`.
 
-**LEDs:** `/sys/class/leds/velocloud:{red,green,blue}:logo/` (`brightness` 0-255,
-or a `trigger` such as `heartbeat` or `netdev`). **Per-jack link:**
+**LEDs:** colour and night hours live in `router.json` (`"led"`); the raw LEDs are
+`/sys/class/leds/velocloud:{red,green,blue}:logo/` (`brightness` 0-255, or a `trigger`
+such as `heartbeat` or `netdev`, until the next scheduled change). **Per-jack link:**
 `/sys/devices/platform/velocloud-edge5x0/ports`.
 
 ## Wi-Fi

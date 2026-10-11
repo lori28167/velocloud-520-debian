@@ -65,6 +65,7 @@ DEFAULTS = {
     },
     "firewall": {"wan_ping": True, "wan_ssh": False, "wan_web": False,
                  "forwards": []},
+    "led": {"color": "#00ff00", "night_off": False, "off_at": "22:00", "on_at": "08:00"},
 }
 
 
@@ -248,6 +249,15 @@ def validate(cfg):
                             err(p + ".port", f"{proto} {port} is already forwarded by rule {used[(proto, port)] + 1}")
                             break
                         used[(proto, port)] = i
+    led = cfg["led"]
+    if not re.fullmatch(r"#[0-9a-fA-F]{6}", str(led["color"])):
+        err("led.color", "colour must look like #00ff00")
+    boolean("led.night_off", led["night_off"])
+    for k in ("off_at", "on_at"):
+        if not re.fullmatch(r"([01][0-9]|2[0-3]):[0-5][0-9]", str(led[k])):
+            err("led." + k, "time must look like 22:00")
+    if led["off_at"] == led["on_at"]:
+        err("led.on_at", "the LED must come back on at a different time")
     return errs
 
 
@@ -597,6 +607,23 @@ hide-password
         # static DNS servers for the ppp ip-up hook (empty: the provider's)
         files[ETC + "/wan-dns"] = " ".join(wan["dns"]) + "\n"
 
+    # front logo LED: colour and night schedule (velocloud-led, velocloud-led.timer)
+    led = cfg["led"]
+    rgb = " ".join(str(int(led["color"][i:i + 2], 16)) for i in (1, 3, 5))
+    files[ETC + "/led.env"] = HEADER + (f'COLOR="{rgb}"\nNIGHT_OFF={1 if led["night_off"] else 0}\n'
+                                        f'OFF_AT={led["off_at"]}\nON_AT={led["on_at"]}\n')
+    files["/etc/systemd/system/velocloud-led.timer"] = HEADER + f"""[Unit]
+Description=Logo LED off at {led['off_at']} and on at {led['on_at']}
+
+[Timer]
+OnCalendar=*-*-* {led['off_at']}:00
+OnCalendar=*-*-* {led['on_at']}:00
+AccuracySec=1s
+
+[Install]
+WantedBy=timers.target
+"""
+
     files["/etc/hostname"] = cfg["hostname"] + "\n"
     # Wi-Fi regulatory domain from the first moment the radio driver loads
     files["/etc/modprobe.d/cfg80211-regdom.conf"] = HEADER + f"options cfg80211 ieee80211_regdom={w['country']}\n"
@@ -723,6 +750,16 @@ def restart_services(cfg, old, changed):
     elif service_active(ppp) or service_enabled(ppp):
         run("systemctl", "disable", "--now", ppp)
         done.append("pppoe")
+    if changed & {ETC + "/led.env", "/etc/systemd/system/velocloud-led.timer"} or \
+            service_enabled("velocloud-led.timer") != cfg["led"]["night_off"]:
+        run("systemctl", "daemon-reload")
+        if cfg["led"]["night_off"]:
+            run("systemctl", "enable", "velocloud-led.timer")
+            run("systemctl", "restart", "velocloud-led.timer")
+        else:
+            run("systemctl", "disable", "--now", "velocloud-led.timer")
+        run("/usr/local/sbin/velocloud-led", "now")
+        done.append("led")
     if "/etc/modprobe.d/cfg80211-regdom.conf" in changed:
         run("iw", "reg", "set", cfg["wifi"]["country"])
     if "/etc/hostname" in changed:

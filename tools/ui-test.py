@@ -44,11 +44,11 @@ with sync_playwright() as p:
         ctx = b.new_context(ignore_https_errors=True, locale=lang, viewport={"width": 1366, "height": 900},
                             extra_http_headers={"Accept-Language": lang})
         page = login(ctx, lang)
-        for i in range(4):
+        for i in range(page.locator(".vc-tabs button").count()):
             tab(page, i)
             name = page.locator(".vc-tabs button").nth(i).inner_text()
             page.screenshot(path=f"{OUT}/{lang}-{i}-{name}.png", full_page=True)
-        print(f"{lang}: tabs={[page.locator('.vc-tabs button').nth(i).inner_text() for i in range(4)]}")
+        print(f"{lang}: tabs={page.locator('.vc-tabs button').all_inner_texts()}")
         ctx.close()
 
     # full apply + confirm flow, Wi-Fi user add/remove (English)
@@ -80,6 +80,15 @@ with sync_playwright() as p:
     page.wait_for_timeout(3000)
     after = page.locator(".vc-card", has_text="Users").locator("tbody tr").all_inner_texts()
     print("wifi users: after add =", users, "| after remove =", after)
+    tab(page, 4)
+    page.get_by_label("Turn off at night").click()
+    page.wait_for_timeout(500)
+    times = page.locator("input[type=time]").count()
+    page.locator(".vc-swatch").nth(2).click()
+    page.wait_for_timeout(500)
+    page.screenshot(path=f"{OUT}/flow-led.png", full_page=True)
+    print("led: time fields =", times, "| apply bar =", page.locator(".vc-bar").count())
+    page.locator(".vc-bar button", has_text="Discard").click()
     ctx.close()
     b.close()
 
