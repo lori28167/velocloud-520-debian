@@ -70,6 +70,10 @@ DEFAULTS = {
     "backup": {"enabled": False, "quota_gb": 50, "reset_day": 1},
     # second radio (USB adapter): same name and security as "wifi", 2.4 GHz
     "wifi2": {"enabled": False, "channel": 6, "width": 20},
+    # second Internet line on the port with role "wan2" (DHCP or static only)
+    "wan2": {"mode": "dhcp", "vlan": 0, "mtu": 0, "address": "", "prefix": 24, "gateway": "", "dns": []},
+    # how the two lines are used: one as backup of the other, or shared per connection
+    "multiwan": {"mode": "failover", "weight1": 1, "weight2": 1},
     "firewall": {"wan_ping": True, "wan_ssh": False, "wan_web": False,
                  "forwards": []},
     "led": {"color": "#00ff00", "night_off": False, "off_at": "22:00", "on_at": "08:00"},
@@ -117,11 +121,13 @@ def validate(cfg):
 
     roles = cfg["ports"]
     for p in PORTS:
-        if roles.get(p) not in ("lan", "wan", "off"):
-            err("ports." + p, "role must be lan, wan or off")
+        if roles.get(p) not in ("lan", "wan", "wan2", "off"):
+            err("ports." + p, "role must be lan, wan, wan2 or off")
     wans = [p for p in PORTS if roles.get(p) == "wan"]
     if len(wans) != 1:
         err("ports", "exactly one port must be the WAN")
+    if len([p for p in PORTS if roles.get(p) == "wan2"]) > 1:
+        err("ports", "at most one port can be the second WAN")
     if not [p for p in PORTS if roles.get(p) == "lan"]:
         err("ports", "at least one port must be in the LAN")
 
@@ -168,35 +174,49 @@ def validate(cfg):
         if h.get("name") and not re.fullmatch(r"[a-zA-Z0-9-]{1,63}", h["name"]):
             err(p + ".name", "letters, digits and '-' only")
 
+    def check_wan(name, wan, modes):
+        if wan["mode"] not in modes:
+            err(f"{name}.mode", "mode must be " + ", ".join(modes[:-1]) + " or " + modes[-1])
+        if not isinstance(wan["vlan"], int) or not 0 <= wan["vlan"] <= 4094:
+            err(f"{name}.vlan", "VLAN must be 0 (none) or 1-4094")
+        if not isinstance(wan["mtu"], int) or not (wan["mtu"] == 0 or 576 <= wan["mtu"] <= 9000):
+            err(f"{name}.mtu", "MTU must be 0 (automatic) or 576-9000")
+        if "ipv6" in wan:
+            boolean(f"{name}.ipv6", wan["ipv6"])
+        if wan["mode"] == "static":
+            a = ip4(f"{name}.address", wan["address"])
+            g = ip4(f"{name}.gateway", wan["gateway"])
+            if not isinstance(wan["prefix"], int) or not 1 <= wan["prefix"] <= 32:
+                err(f"{name}.prefix", "prefix must be 1-32")
+            elif a:
+                net = ipaddress.IPv4Network(f"{a}/{wan['prefix']}", strict=False)
+                if g and g not in net:
+                    err(f"{name}.gateway", "the gateway must be inside the WAN subnet")
+                if lan_net and net.overlaps(lan_net):
+                    err(f"{name}.address", "the WAN subnet overlaps the LAN subnet")
+            if not wan["dns"]:
+                err(f"{name}.dns", "give at least one DNS server")
+        for i, d in enumerate(wan["dns"]):
+            ip4(f"{name}.dns.{i}", d)
+        if wan["mode"] == "pppoe" and "pppoe_user" in wan:
+            if not wan["pppoe_user"]:
+                err(f"{name}.pppoe_user", "PPPoE needs a user name")
+            for k in ("pppoe_user", "pppoe_password"):
+                if re.search(r"[\"\\\n]", str(wan[k])):
+                    err(f"{name}.{k}", "quotes, backslashes and new lines are not allowed")
+
     wan = cfg["wan"]
-    if wan["mode"] not in ("dhcp", "static", "pppoe"):
-        err("wan.mode", "mode must be dhcp, static or pppoe")
-    if not isinstance(wan["vlan"], int) or not 0 <= wan["vlan"] <= 4094:
-        err("wan.vlan", "VLAN must be 0 (none) or 1-4094")
-    if not isinstance(wan["mtu"], int) or not (wan["mtu"] == 0 or 576 <= wan["mtu"] <= 9000):
-        err("wan.mtu", "MTU must be 0 (automatic) or 576-9000")
-    boolean("wan.ipv6", wan["ipv6"])
-    if wan["mode"] == "static":
-        a = ip4("wan.address", wan["address"])
-        g = ip4("wan.gateway", wan["gateway"])
-        if not isinstance(wan["prefix"], int) or not 1 <= wan["prefix"] <= 32:
-            err("wan.prefix", "prefix must be 1-32")
-        elif a:
-            net = ipaddress.IPv4Network(f"{a}/{wan['prefix']}", strict=False)
-            if g and g not in net:
-                err("wan.gateway", "the gateway must be inside the WAN subnet")
-            if lan_net and net.overlaps(lan_net):
-                err("wan.address", "the WAN subnet overlaps the LAN subnet")
-        if not wan["dns"]:
-            err("wan.dns", "give at least one DNS server")
-    for i, d in enumerate(wan["dns"]):
-        ip4(f"wan.dns.{i}", d)
-    if wan["mode"] == "pppoe":
-        if not wan["pppoe_user"]:
-            err("wan.pppoe_user", "PPPoE needs a user name")
-        for k in ("pppoe_user", "pppoe_password"):
-            if re.search(r"[\"\\\n]", str(wan[k])):
-                err("wan." + k, "quotes, backslashes and new lines are not allowed")
+    check_wan("wan", wan, ["dhcp", "static", "pppoe"])
+    mw = cfg["multiwan"]
+    if mw["mode"] not in ("failover", "balance"):
+        err("multiwan.mode", "mode must be failover or balance")
+    for k in ("weight1", "weight2"):
+        if not isinstance(mw[k], int) or isinstance(mw[k], bool) or not 1 <= mw[k] <= 10:
+            err("multiwan." + k, "the weight must be between 1 and 10")
+    if second_wan_port(cfg):
+        check_wan("wan2", cfg["wan2"], ["dhcp", "static"])
+        if cfg["wan2"]["mode"] == "static" and wan["mode"] == "static" and cfg["wan2"]["address"] == wan["address"]:
+            err("wan2.address", "the two lines need different addresses")
 
     w = cfg["wifi"]
     boolean("wifi.enabled", w["enabled"])
@@ -410,6 +430,20 @@ HEADER = "# generated by velocloud-apply from /etc/velocloud/router.json: edit t
 NET = "/etc/systemd/network"
 
 
+def second_wan_port(cfg):
+    """The port with the second Internet line, or None."""
+    return next((p for p in PORTS if cfg["ports"].get(p) == "wan2"), None)
+
+
+def wan2_names(cfg):
+    """(physical port, L2 device carrying the line, L3 interface) of the second WAN, or None."""
+    port = second_wan_port(cfg)
+    if not port:
+        return None
+    l2 = f"{port}.{cfg['wan2']['vlan']}" if cfg["wan2"]["vlan"] else port
+    return port, l2, l2
+
+
 def wan_names(cfg):
     """(physical WAN port, L2 device carrying the WAN, L3 interface)."""
     port = [p for p in PORTS if cfg["ports"][p] == "wan"][0]
@@ -431,30 +465,43 @@ def render(cfg):
     files = {}
     port, l2, l3 = wan_names(cfg)
     wan, lan, w = cfg["wan"], cfg["lan"], cfg["wifi"]
+    wan2, w2 = cfg["wan2"], wan2_names(cfg)
     backup = cfg["backup"]["enabled"]
     mtu = [("MTUBytes", wan["mtu"])] if wan["mtu"] else []
 
-    def wan_ip_sections(dev):
+    def wan_ip_sections(dev, wan=wan, second=False):
+        # with two lines: higher route metric on the second one, loose reverse
+        # path filter (replies may come back on the other line)
+        mtu = [("MTUBytes", wan["mtu"])] if wan["mtu"] else []
+        loose = [("IPv4ReversePathFilter", "loose")] if w2 else []
+        ipv6 = wan.get("ipv6", False)
         if wan["mode"] == "pppoe":
             return [("Match", [("Name", dev)]),
-                    ("Network", [("LinkLocalAddressing", "no"), ("IPv6AcceptRA", "no")]),
+                    ("Network", [("LinkLocalAddressing", "no"), ("IPv6AcceptRA", "no")] + loose),
                     ("Link", [("RequiredForOnline", "carrier")] + mtu)]
-        net = [("IPv6AcceptRA", "yes" if wan["ipv6"] else "no")]
-        if not wan["ipv6"]:
+        net = [("IPv6AcceptRA", "yes" if ipv6 else "no")] + loose
+        if not ipv6:
             net.append(("LinkLocalAddressing", "no"))
+        extra = []
         if wan["mode"] == "dhcp":
-            net.insert(0, ("DHCP", "yes" if wan["ipv6"] else "ipv4"))
+            net.insert(0, ("DHCP", "yes" if ipv6 else "ipv4"))
             secs = [("Match", [("Name", dev)]), ("Network", net),
-                    ("DHCPv4", [("UseHostname", "no")] + ([("UseDNS", "no")] if wan["dns"] else []))]
-            if wan["ipv6"]:
+                    ("DHCPv4", [("UseHostname", "no")] + ([("RouteMetric", 2048)] if second else [])
+                     + ([("UseDNS", "no")] if wan["dns"] else []))]
+            if ipv6:
                 secs.append(("DHCPv6", [("UseDelegatedPrefix", "yes")] + ([("UseDNS", "no")] if wan["dns"] else [])))
         else:
-            if wan["ipv6"]:
+            if ipv6:
                 net.insert(0, ("DHCP", "ipv6"))
-            net[:0] = [("Address", f"{wan['address']}/{wan['prefix']}"), ("Gateway", wan["gateway"])]
+            if second:
+                net[:0] = [("Address", f"{wan['address']}/{wan['prefix']}")]
+                extra = [("Route", [("Gateway", wan["gateway"]), ("Metric", 2048)])]
+            else:
+                net[:0] = [("Address", f"{wan['address']}/{wan['prefix']}"), ("Gateway", wan["gateway"])]
             secs = [("Match", [("Name", dev)]), ("Network", net)]
         for d in wan["dns"]:
             secs[1][1].append(("DNS", d))
+        secs += extra
         secs.append(("Link", [("RequiredForOnline", "routable")] + mtu))
         return secs
 
@@ -467,6 +514,17 @@ def render(cfg):
         elif role == "off":
             files[name] = ini([("Match", [("Name", p)]),
                                ("Link", [("ActivationPolicy", "always-down"), ("RequiredForOnline", "no")])])
+        elif role == "wan2":
+            mtu2 = [("MTUBytes", wan2["mtu"])] if wan2["mtu"] else []
+            if wan2["vlan"]:
+                files[name] = ini([("Match", [("Name", p)]),
+                                   ("Network", [("VLAN", w2[1]), ("LinkLocalAddressing", "no"), ("IPv6AcceptRA", "no")]),
+                                   ("Link", [("RequiredForOnline", "carrier")] + mtu2)])
+                files[f"{NET}/26-vc-wan2-vlan.netdev"] = ini([("NetDev", [("Name", w2[1]), ("Kind", "vlan")]),
+                                                              ("VLAN", [("Id", wan2["vlan"])])])
+                files[f"{NET}/32-vc-wan2-vlan.network"] = ini(wan_ip_sections(w2[1], wan2, True))
+            else:
+                files[name] = ini(wan_ip_sections(p, wan2, True))
         elif wan["vlan"]:
             files[name] = ini([("Match", [("Name", p)]),
                                ("Network", [("VLAN", l2), ("LinkLocalAddressing", "no"), ("IPv6AcceptRA", "no")]),
@@ -541,12 +599,12 @@ dhcp-option=option:dns-server,{lan['address']}
         protos = ["tcp", "udp"] if f["proto"] == "tcp+udp" else [f["proto"]]
         for proto in protos:
             dnat.append(f"iifname $WAN {proto} dport {ports} dnat to {to} comment \"{f.get('name', '')[:40]}\"")
-    mss = "\t\ttcp flags syn tcp option maxseg size set rt mtu\n" if wan["mode"] == "pppoe" or wan["mtu"] or backup else ""
+    mss = "\t\ttcp flags syn tcp option maxseg size set rt mtu\n" if wan["mode"] == "pppoe" or wan["mtu"] or backup or w2 else ""
     nft = f"""#!/usr/sbin/nft -f
 {HEADER}flush ruleset
 
 define WAN = "{l3}"
-define WANS = {{ {', '.join(f'"{i}"' for i in ([l3] + ([BACKUP] if backup else [])))} }}
+define WANS = {{ {', '.join(f'"{i}"' for i in ([l3] + ([w2[2]] if w2 else []) + ([BACKUP] if backup else [])))} }}
 define LAN = "br-lan"
 
 table inet filter {{
@@ -586,7 +644,11 @@ table ip nat {{
 }
 """
     files["/etc/nftables.conf"] = nft
-    files[ETC + "/flowtable.devices"] = " ".join([port] + [p for p in PORTS if cfg["ports"][p] == "lan"]) + "\n"
+    if w2:
+        # both lines may sit in the same subnet (two ports of one modem): answer ARP only
+        # on the interface that owns the address
+        files[SYSCTL_MULTIWAN] = HEADER + "net.ipv4.conf.all.arp_ignore=1\nnet.ipv4.conf.all.arp_announce=2\n"
+    files[ETC + "/flowtable.devices"] = " ".join([port] + ([w2[0]] if w2 else []) + [p for p in PORTS if cfg["ports"][p] == "lan"]) + "\n"
 
     # Wi-Fi: one hostapd per radio, same name and security on both
     def hostapd_conf(iface, band, channel, width):
@@ -699,10 +761,11 @@ def radius_secret():
 
 LEGACY = [f"{NET}/30-lan-ports.network", f"{NET}/40-br-lan.network", f"{NET}/50-wan.network",
           "/etc/dnsmasq.d/lan.conf"]
+SYSCTL_MULTIWAN = "/etc/sysctl.d/90-vc-multiwan.conf"
 SECRET_FILES = ("/etc/ppp/chap-secrets", "/etc/ppp/pap-secrets", "/etc/hostapd/hostapd.conf",
                 "/etc/hostapd/hostapd-2g.conf")
 # removed when the configuration no longer needs them
-OPTIONAL = ("/etc/hostapd/hostapd.conf", "/etc/hostapd/hostapd-2g.conf", "/etc/ppp/peers/velocloud-wan",
+OPTIONAL = (SYSCTL_MULTIWAN, "/etc/hostapd/hostapd.conf", "/etc/hostapd/hostapd-2g.conf", "/etc/ppp/peers/velocloud-wan",
             "/etc/ppp/chap-secrets", "/etc/ppp/pap-secrets", ETC + "/wan-dns")
 
 
@@ -755,6 +818,9 @@ def restart_services(cfg, old, changed):
             _, ol2, _ = wan_names(old)
             if ol2 != l2 and "." in ol2:
                 run("ip", "link", "del", ol2)
+            ow2 = wan2_names(old)
+            if ow2 and "." in ow2[1] and (not wan2_names(cfg) or wan2_names(cfg)[1] != ow2[1]):
+                run("ip", "link", "del", ow2[1])
         run("networkctl", "reload", check=True)
         # reconfigure only the links whose files changed, so the LAN stays up
         devs = set()
@@ -766,6 +832,8 @@ def restart_services(cfg, old, changed):
                 devs.add("br-lan")
             if "-vc-wan-vlan" in c or c.endswith("/50-wan.network"):
                 devs |= {port, l2}
+            if "-vc-wan2-vlan" in c and wan2_names(cfg):
+                devs |= {wan2_names(cfg)[0], wan2_names(cfg)[1]}
             if c.endswith("/30-lan-ports.network"):
                 devs |= {p for p in PORTS if cfg["ports"][p] == "lan"}
         for dev in sorted(devs):
@@ -807,8 +875,14 @@ def restart_services(cfg, old, changed):
     elif not radius_on and (service_active("freeradius") or service_enabled("freeradius")):
         run("systemctl", "disable", "--now", "freeradius")
         done.append("radius")
+    if SYSCTL_MULTIWAN in changed:
+        if wan2_names(cfg):
+            run("sysctl", "-q", "-p", SYSCTL_MULTIWAN)
+        else:
+            run("sysctl", "-q", "-w", "net.ipv4.conf.all.arp_ignore=0", "net.ipv4.conf.all.arp_announce=0")
+        done.append("multiwan")
     watch = "velocloud-wanwatch"
-    if cfg["backup"]["enabled"]:
+    if cfg["backup"]["enabled"] or second_wan_port(cfg):
         if not service_enabled(watch):
             run("systemctl", "enable", "--now", watch)
             done.append("backup")

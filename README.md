@@ -42,6 +42,10 @@ firewall. Underneath it is plain Debian: `apt`, systemd, DKMS, nothing forked.
     DHCP and the connection type and VLAN are filled in; the PPPoE user and password are
     the ones of your contract. The values are the ones the operators publish for free modems
     and should be checked with yours;
+  - second Internet line (WAN2) on another port, DHCP or static: either as a backup of the main
+    one or both at once (each connection uses one line, shared by weights you choose; a single
+    download never goes faster than one line). Two ports of the same modem work too. Health of every
+    line is checked by ping, and a line that fails is left out until it is back for a minute;
   - backup Internet: a USB hotspot with USB tethering (RNDIS/CDC) becomes `usbwan`; when the
     main line has no Internet (checked by ping, not just by the link) the router switches to it
     and goes back a minute after the main line recovers. Every byte through it is counted per

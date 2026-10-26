@@ -77,12 +77,23 @@ def addresses():
 
 
 def default_route():
+    """The default route in use (lowest metric, possibly shared by several
+    devices) and the gateway of every device that has one."""
+    out = {"gateway": "", "dev": "", "devs": [], "gateways": {}}
     try:
-        for r in json.loads(cmd("ip", "-j", "route", "show", "default") or "[]"):
-            return {"gateway": r.get("gateway", ""), "dev": r.get("dev", "")}
+        routes = json.loads(cmd("ip", "-j", "route", "show", "default") or "[]")
     except ValueError:
-        pass
-    return {"gateway": "", "dev": ""}
+        return out
+    for i, r in enumerate(routes):
+        for h in r.get("nexthops") or [r]:
+            if h.get("dev"):
+                out["gateways"].setdefault(h["dev"], h.get("gateway", ""))
+                if i == 0:
+                    out["devs"].append(h["dev"])
+    if out["devs"]:
+        out["dev"] = out["devs"][0]
+        out["gateway"] = out["gateways"][out["dev"]]
+    return out
 
 
 def wan_dns(dev):
@@ -154,7 +165,7 @@ def backup(cfg, addrs, route):
     b = cfg.get("backup", {})
     out = {"enabled": bool(b.get("enabled")), "state": "off", "present": False, "used": 0,
            "quota": b.get("quota_gb", 50) * 1_000_000_000, "addresses": addrs.get("usbwan", []),
-           "in_use": route["dev"] == "usbwan"}
+           "in_use": "usbwan" in route["devs"]}
     if not out["enabled"]:
         return out
     try:
@@ -249,6 +260,9 @@ def main():
     wcfg = cfg.get("wan", {})
     wan_l3 = "ppp-wan" if wcfg.get("mode") == "pppoe" else (
         f"{wan_port}.{wcfg['vlan']}" if wcfg.get("vlan") else wan_port)
+    port2 = next((p for p, r in ports.items() if r == "wan2"), None)
+    w2cfg = cfg.get("wan2", {})
+    wan2_l3 = (f"{port2}.{w2cfg['vlan']}" if w2cfg.get("vlan") else port2) if port2 else None
     addrs = addresses()
     route = default_route()
     pending = read(f"{ETC}/pending")
@@ -259,9 +273,14 @@ def main():
         "jacks": jacks(),
         "wan": {"port": wan_port, "dev": wan_l3, "mode": wcfg.get("mode", "dhcp"),
                 "addresses": addrs.get(wan_l3, []),
-                "gateway": route["gateway"] if route["dev"] == wan_l3 else "",
-                "online": route["dev"] == wan_l3, "dns": wan_dns(wan_l3),
+                "gateway": route["gateways"].get(wan_l3, ""),
+                "online": wan_l3 in route["devs"], "dns": wan_dns(wan_l3),
                 "counters": iface(wan_l3)},
+        "wan2": {"port": port2, "dev": wan2_l3, "mode": w2cfg.get("mode", "dhcp"),
+                 "addresses": addrs.get(wan2_l3, []), "gateway": route["gateways"].get(wan2_l3, ""),
+                 "online": wan2_l3 in route["devs"], "counters": iface(wan2_l3)} if port2 else None,
+        "lines": json.loads(read("/run/velocloud/wan.json") or "null"),
+        "multiwan": cfg.get("multiwan", {}),
         "lan": {"addresses": addrs.get("br-lan", []), "counters": iface("br-lan")},
         "leases": leases(),
         "wifi": wifi(cfg),
