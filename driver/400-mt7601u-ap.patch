@@ -1,0 +1,375 @@
+diff -urN a/beacon.c b/beacon.c
+--- a/beacon.c
++++ b/beacon.c
+@@ -0,0 +1,208 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * AP mode support: hardware beaconing, TIM refresh and delivery of
++ * buffered broadcast/multicast frames after the DTIM beacon.
++ *
++ * The chip sends the beacon by itself from SRAM at every TBTT, so the host
++ * only has to keep the SRAM copy fresh.  There is no pre-TBTT interrupt on
++ * USB, so the refresh is paced from the TSF timer read over the bus.
++ */
++
++#include "mt7601u.h"
++#include "mac.h"
++
++#define MT_BCN_SLOT_SIZE	0x200
++#define MT_BCN_PRE_TBTT_US	25000
++#define MT_BCN_MIN_LEAD_US	8000
++#define MT_BC_POST_TBTT_US	4000
++
++static u64 mt7601u_read_tsf(struct mt7601u_dev *dev)
++{
++	u32 hi, lo;
++
++	do {
++		hi = mt7601u_rr(dev, MT_TSF_TIMER_DW1);
++		lo = mt7601u_rr(dev, MT_TSF_TIMER_DW0);
++	} while (hi != mt7601u_rr(dev, MT_TSF_TIMER_DW1));
++
++	return (u64)hi << 32 | lo;
++}
++
++static int mt7601u_beacon_write(struct mt7601u_dev *dev,
++				struct ieee80211_vif *vif)
++{
++	struct ieee80211_tx_info *info;
++	struct ieee80211_tx_rate *rate;
++	struct mt76_txwi *txwi;
++	struct sk_buff *skb;
++	u16 rate_ctl;
++	u8 nss;
++	int len;
++	u8 *buf;
++
++	skb = ieee80211_beacon_get(dev->hw, vif, 0);
++	if (!skb)
++		return -ENOMEM;
++
++	len = round_up(sizeof(*txwi) + skb->len, 4);
++	if (len > MT_BCN_SLOT_SIZE) {
++		dev_err_once(dev->dev, "beacon too long (%d bytes)\n", skb->len);
++		dev_kfree_skb(skb);
++		return -E2BIG;
++	}
++
++	buf = kzalloc(len, GFP_KERNEL);
++	if (!buf) {
++		dev_kfree_skb(skb);
++		return -ENOMEM;
++	}
++
++	info = IEEE80211_SKB_CB(skb);
++	rate = &info->control.rates[0];
++	if (rate->idx < 0 || !rate->count)
++		rate_ctl = 0;
++	else
++		rate_ctl = mt76_mac_tx_rate_val(dev, rate, &nss);
++
++	txwi = (struct mt76_txwi *)buf;
++	txwi->flags = cpu_to_le16(MT_TXWI_FLAGS_TS);
++	txwi->rate_ctl = cpu_to_le16(rate_ctl);
++	txwi->wcid = 0xff;
++	txwi->ack_ctl = MT_TXWI_ACK_CTL_NSEQ;
++	txwi->len_ctl = cpu_to_le16(skb->len);
++	memcpy(buf + sizeof(*txwi), skb->data, skb->len);
++
++	mt7601u_wr_copy(dev, dev->beacon_offsets[0], buf, len);
++
++	kfree(buf);
++	dev_kfree_skb(skb);
++
++	return 0;
++}
++
++static void mt7601u_beacon_hw_enable(struct mt7601u_dev *dev, bool enable,
++				     u16 beacon_int)
++{
++	u32 val = mt7601u_rr(dev, MT_BEACON_TIME_CFG);
++
++	val &= ~(MT_BEACON_TIME_CFG_TIMER_EN | MT_BEACON_TIME_CFG_SYNC_MODE |
++		 MT_BEACON_TIME_CFG_TBTT_EN | MT_BEACON_TIME_CFG_BEACON_TX);
++
++	if (enable) {
++		val &= ~MT_BEACON_TIME_CFG_INTVAL;
++		val |= FIELD_PREP(MT_BEACON_TIME_CFG_INTVAL, beacon_int << 4) |
++		       FIELD_PREP(MT_BEACON_TIME_CFG_SYNC_MODE, 3) |
++		       MT_BEACON_TIME_CFG_TIMER_EN |
++		       MT_BEACON_TIME_CFG_TBTT_EN |
++		       MT_BEACON_TIME_CFG_BEACON_TX;
++	}
++
++	mt7601u_wr(dev, MT_BEACON_TIME_CFG, val);
++}
++
++static unsigned long mt7601u_usecs_to_jiffies_up(s64 us)
++{
++	return us <= 0 ? 0 : usecs_to_jiffies(us);
++}
++
++void mt7601u_beacon_work(struct work_struct *work)
++{
++	struct mt7601u_dev *dev = container_of(work, struct mt7601u_dev,
++					       bcn_work.work);
++	u32 interval_us;
++	s64 to_tbtt, lead;
++	u64 tsf;
++
++	mutex_lock(&dev->bcn_mutex);
++
++	if (!dev->bcn_vif)
++		goto out;
++
++	interval_us = dev->bcn_int * 1024;
++	tsf = mt7601u_read_tsf(dev);
++	to_tbtt = interval_us - do_div(tsf, interval_us);
++
++	if (to_tbtt < MT_BCN_MIN_LEAD_US ||
++	    to_tbtt > MT_BCN_PRE_TBTT_US + 2 * MT_BCN_MIN_LEAD_US) {
++		/* Out of the safe window, wait for the next one */
++		lead = to_tbtt - MT_BCN_PRE_TBTT_US;
++		if (lead < 0)
++			lead += interval_us;
++		ieee80211_queue_delayed_work(dev->hw, &dev->bcn_work,
++					     mt7601u_usecs_to_jiffies_up(lead));
++		goto out;
++	}
++
++	mt7601u_beacon_write(dev, dev->bcn_vif);
++
++	ieee80211_queue_delayed_work(dev->hw, &dev->bc_work,
++				     mt7601u_usecs_to_jiffies_up(to_tbtt +
++						MT_BC_POST_TBTT_US));
++	ieee80211_queue_delayed_work(dev->hw, &dev->bcn_work,
++				     mt7601u_usecs_to_jiffies_up(to_tbtt +
++						interval_us - MT_BCN_PRE_TBTT_US));
++out:
++	mutex_unlock(&dev->bcn_mutex);
++}
++
++/* Beacon just went out: if it was a DTIM one, send what was held back. */
++void mt7601u_bc_work(struct work_struct *work)
++{
++	struct mt7601u_dev *dev = container_of(work, struct mt7601u_dev,
++					       bc_work.work);
++	struct ieee80211_tx_control control = {};
++	struct ieee80211_vif *vif;
++	struct sk_buff *skb;
++
++	mutex_lock(&dev->bcn_mutex);
++	vif = dev->bcn_vif;
++	if (!vif)
++		goto out;
++
++	while ((skb = ieee80211_get_buffered_bc(dev->hw, vif)))
++		mt7601u_tx(dev->hw, &control, skb);
++out:
++	mutex_unlock(&dev->bcn_mutex);
++}
++
++int mt7601u_beacon_enable(struct mt7601u_dev *dev, struct ieee80211_vif *vif,
++			  u16 beacon_int)
++{
++	int ret;
++
++	mt7601u_beacon_disable(dev);
++
++	if (!beacon_int)
++		return -EINVAL;
++
++	mt7601u_addr_wr(dev, MT_MAC_BSSID_DW0, vif->addr);
++
++	ret = mt7601u_beacon_write(dev, vif);
++	if (ret)
++		return ret;
++
++	mutex_lock(&dev->bcn_mutex);
++	dev->bcn_vif = vif;
++	dev->bcn_int = beacon_int;
++	mutex_unlock(&dev->bcn_mutex);
++
++	mt7601u_wr(dev, MT_BCN_BYPASS_MASK, 0xffff & ~BIT(0));
++	mt7601u_beacon_hw_enable(dev, true, beacon_int);
++
++	ieee80211_queue_delayed_work(dev->hw, &dev->bcn_work, 0);
++
++	return 0;
++}
++
++void mt7601u_beacon_disable(struct mt7601u_dev *dev)
++{
++	mutex_lock(&dev->bcn_mutex);
++	dev->bcn_vif = NULL;
++	mutex_unlock(&dev->bcn_mutex);
++
++	cancel_delayed_work_sync(&dev->bcn_work);
++	cancel_delayed_work_sync(&dev->bc_work);
++
++	mt7601u_beacon_hw_enable(dev, false, 0);
++	mt7601u_wr(dev, MT_BCN_BYPASS_MASK, 0xffff);
++}
+diff -urN a/init.c b/init.c
+--- a/init.c
++++ b/init.c
+@@ -445,6 +445,7 @@
+ 	mutex_init(&dev->reg_atomic_mutex);
+ 	mutex_init(&dev->hw_atomic_mutex);
+ 	mutex_init(&dev->mutex);
++	mutex_init(&dev->bcn_mutex);
+ 	spin_lock_init(&dev->tx_lock);
+ 	spin_lock_init(&dev->rx_lock);
+ 	spin_lock_init(&dev->lock);
+@@ -583,7 +584,7 @@
+ 	dev->wcid_mask[0] |= 1;
+ 
+ 	/* init fake wcid for monitor interfaces */
+-	dev->mon_wcid = devm_kmalloc(dev->dev, sizeof(*dev->mon_wcid),
++	dev->mon_wcid = devm_kzalloc(dev->dev, sizeof(*dev->mon_wcid),
+ 				     GFP_KERNEL);
+ 	if (!dev->mon_wcid)
+ 		return -ENOMEM;
+@@ -609,7 +610,8 @@
+ 	SET_IEEE80211_PERM_ADDR(hw, dev->macaddr);
+ 
+ 	wiphy->features |= NL80211_FEATURE_ACTIVE_MONITOR;
+-	wiphy->interface_modes = BIT(NL80211_IFTYPE_STATION);
++	wiphy->interface_modes = BIT(NL80211_IFTYPE_STATION) |
++				 BIT(NL80211_IFTYPE_AP);
+ 	wiphy->flags |= WIPHY_FLAG_SUPPORTS_TDLS;
+ 
+ 	wiphy_ext_feature_set(wiphy, NL80211_EXT_FEATURE_CQM_RSSI_LIST);
+@@ -619,6 +621,8 @@
+ 		return ret;
+ 
+ 	INIT_DELAYED_WORK(&dev->mac_work, mt7601u_mac_work);
++	INIT_DELAYED_WORK(&dev->bcn_work, mt7601u_beacon_work);
++	INIT_DELAYED_WORK(&dev->bc_work, mt7601u_bc_work);
+ 	INIT_DELAYED_WORK(&dev->stat_work, mt7601u_tx_stat);
+ 
+ 	ret = ieee80211_register_hw(hw);
+diff -urN a/main.c b/main.c
+--- a/main.c
++++ b/main.c
+@@ -34,6 +34,7 @@
+ 
+ 	mutex_lock(&dev->mutex);
+ 
++	mt7601u_beacon_disable(dev);
+ 	cancel_delayed_work_sync(&dev->cal_work);
+ 	cancel_delayed_work_sync(&dev->mac_work);
+ 	mt7601u_mac_stop(dev);
+@@ -75,6 +76,9 @@
+ 	struct mt76_vif *mvif = (struct mt76_vif *) vif->drv_priv;
+ 	unsigned int wcid = mvif->group_wcid.idx;
+ 
++	if (vif->type == NL80211_IFTYPE_AP)
++		mt7601u_beacon_disable(dev);
++
+ 	dev->wcid_mask[wcid / BITS_PER_LONG] &= ~BIT(wcid % BITS_PER_LONG);
+ }
+ 
+@@ -180,6 +184,14 @@
+ 	if (changed & BSS_CHANGED_ASSOC)
+ 		mt7601u_phy_recalibrate_after_assoc(dev);
+ 
++	if (vif->type == NL80211_IFTYPE_AP &&
++	    changed & (BSS_CHANGED_BEACON_ENABLED | BSS_CHANGED_BEACON_INT)) {
++		if (info->enable_beacon)
++			mt7601u_beacon_enable(dev, vif, info->beacon_int);
++		else
++			mt7601u_beacon_disable(dev);
++	}
++
+ 	mutex_unlock(&dev->mutex);
+ }
+ 
+diff -urN a/Makefile b/Makefile
+--- a/Makefile
++++ b/Makefile
+@@ -3,6 +3,6 @@
+ 
+ mt7601u-objs	= \
+ 	usb.o init.o main.o mcu.o trace.o dma.o core.o eeprom.o phy.o \
+-	mac.o util.o debugfs.o tx.o
++	mac.o util.o debugfs.o tx.o beacon.o
+ 
+ CFLAGS_trace.o := -I$(src)
+diff -urN a/mt7601u.h b/mt7601u.h
+--- a/mt7601u.h
++++ b/mt7601u.h
+@@ -167,6 +167,14 @@
+ 	struct delayed_work cal_work;
+ 	struct delayed_work mac_work;
+ 
++	/* AP beaconing, see beacon.c */
++	struct mutex bcn_mutex;
++	struct delayed_work bcn_work;
++	struct delayed_work bc_work;
++	struct ieee80211_vif *bcn_vif;
++	u16 bcn_int;
++
++
+ 	struct workqueue_struct *stat_wq;
+ 	struct delayed_work stat_work;
+ 
+@@ -360,6 +368,11 @@
+ 				int ht_mode);
+ void mt7601u_mac_set_short_preamble(struct mt7601u_dev *dev, bool short_preamb);
+ void mt7601u_mac_config_tsf(struct mt7601u_dev *dev, bool enable, int interval);
++int mt7601u_beacon_enable(struct mt7601u_dev *dev, struct ieee80211_vif *vif,
++			  u16 beacon_int);
++void mt7601u_beacon_disable(struct mt7601u_dev *dev);
++void mt7601u_beacon_work(struct work_struct *work);
++void mt7601u_bc_work(struct work_struct *work);
+ void
+ mt7601u_mac_wcid_setup(struct mt7601u_dev *dev, u8 idx, u8 vif_idx, u8 *mac);
+ void mt7601u_mac_set_ampdu_factor(struct mt7601u_dev *dev);
+diff -urN a/regs.h b/regs.h
+--- a/regs.h
++++ b/regs.h
+@@ -306,6 +306,8 @@
+ #define MT_BEACON_TIME_CFG_TSF_COMP	GENMASK(31, 24)
+ 
+ #define MT_TBTT_SYNC_CFG		0x1118
++#define MT_TSF_TIMER_DW0		0x111c
++#define MT_TSF_TIMER_DW1		0x1120
+ #define MT_TBTT_TIMER_CFG		0x1124
+ 
+ #define MT_INT_TIMER_CFG		0x1128
+diff -urN a/tx.c b/tx.c
+--- a/tx.c
++++ b/tx.c
+@@ -133,6 +133,7 @@
+ {
+ 	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
+ 	struct ieee80211_tx_rate *rate = &info->control.rates[0];
++	__le16 fc = ((struct ieee80211_hdr *)skb->data)->frame_control;
+ 	struct mt76_txwi *txwi;
+ 	unsigned long flags;
+ 	bool is_probe;
+@@ -177,6 +178,9 @@
+ 			txwi->flags = 0;
+ 	}
+ 
++	if (ieee80211_is_beacon(fc) || ieee80211_is_probe_resp(fc))
++		txwi->flags |= cpu_to_le16(MT_TXWI_FLAGS_TS);
++
+ 	txwi->wcid = wcid->idx;
+ 
+ 	is_probe = !!(info->flags & IEEE80211_TX_CTL_RATE_CTRL_PROBE);
+@@ -217,6 +221,13 @@
+ 		wcid = &mvif->group_wcid;
+ 	}
+ 
++	/* The hardware encrypts with the key of the WCID whatever the frame
++	 * is, keep unprotected management frames of an AP away from it.
++	 */
++	if (vif && vif->type == NL80211_IFTYPE_AP && !info->control.hw_key &&
++	    ieee80211_is_mgmt(((struct ieee80211_hdr *)skb->data)->frame_control))
++		wcid = dev->mon_wcid;
++
+ 	txwi = mt7601u_push_txwi(dev, skb, sta, wcid, pkt_len);
+ 
+ 	if (mt7601u_dma_enqueue_tx(dev, skb, wcid, hw_q))

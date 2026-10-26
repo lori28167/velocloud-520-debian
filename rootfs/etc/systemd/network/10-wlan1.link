@@ -1,0 +1,6 @@
+# USB Wi-Fi adapter (MediaTek MT7601U, 2.4 GHz access point)
+[Match]
+Driver=mt7601u
+
+[Link]
+Name=wlan1
