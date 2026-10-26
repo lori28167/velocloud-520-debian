@@ -42,6 +42,8 @@ PORTS = ["lan14", "lan58", "ge1", "ge2", "sfp1", "sfp2"]
 PORT_LABELS = {"lan14": "LAN1-4", "lan58": "LAN5-8", "ge1": "GE1", "ge2": "GE2",
                "sfp1": "SFP1", "sfp2": "SFP2"}
 WLAN = "wlan0"
+BACKUP = "usbwan"		# USB hotspot used as backup WAN (see 10-usbwan.link)
+WLAN2 = "wlan1"		# USB adapter, 2.4 GHz second radio of the same network
 
 DEFAULTS = {
     "version": 1,
@@ -63,6 +65,11 @@ DEFAULTS = {
         "width": 80, "country": "IT", "hidden": False,
         "security": "enterprise", "psk": "", "org": "VeloCloud",
     },
+    # backup Internet over a USB hotspot: used when the main WAN has no Internet
+    # and stopped for good at quota_gb (decimal GB) until the monthly reset day
+    "backup": {"enabled": False, "quota_gb": 50, "reset_day": 1},
+    # second radio (USB adapter): same name and security as "wifi", 2.4 GHz
+    "wifi2": {"enabled": False, "channel": 6, "width": 20},
     "firewall": {"wan_ping": True, "wan_ssh": False, "wan_web": False,
                  "forwards": []},
     "led": {"color": "#00ff00", "night_off": False, "off_at": "22:00", "on_at": "08:00"},
@@ -202,7 +209,7 @@ def validate(cfg):
         err("wifi.band", "band must be 2 (2.4 GHz) or 5 (5 GHz)")
     if w["width"] not in (20, 40, 80) or (w["band"] == "2" and w["width"] == 80):
         err("wifi.width", "width must be 20 or 40 MHz (2.4 GHz) or 20/40/80 MHz (5 GHz)")
-    allowed = wifi_channels().get(w["band"])
+    allowed = wifi_channels(WLAN).get(w["band"])
     if not isinstance(w["channel"], int):
         err("wifi.channel", "channel must be a number")
     elif allowed is not None and w["channel"] not in allowed:
@@ -217,6 +224,27 @@ def validate(cfg):
         err("wifi.psk", "new lines are not allowed")
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9 ._-]{0,40}", str(w["org"])):
         err("wifi.org", "letters, digits, spaces, '.', '_' and '-' only")
+
+    w2 = cfg["wifi2"]
+    boolean("wifi2.enabled", w2["enabled"])
+    if w2["enabled"] and not w["enabled"]:
+        err("wifi2.enabled", "the 2.4 GHz radio shares the network of the main Wi-Fi: switch that on first")
+    if w2["enabled"] and w["band"] != "5":
+        err("wifi2.enabled", "the main Wi-Fi must be on 5 GHz to add a 2.4 GHz radio")
+    if w2["width"] not in (20, 40):
+        err("wifi2.width", "width must be 20 or 40 MHz")
+    allowed2 = wifi_channels(WLAN2).get("2")
+    if not isinstance(w2["channel"], int):
+        err("wifi2.channel", "channel must be a number")
+    elif allowed2 is not None and w2["channel"] not in allowed2:
+        err("wifi2.channel", "channel not usable here: " + ", ".join(map(str, allowed2)))
+
+    b = cfg["backup"]
+    boolean("backup.enabled", b["enabled"])
+    if not isinstance(b["quota_gb"], int) or isinstance(b["quota_gb"], bool) or not 1 <= b["quota_gb"] <= 10000:
+        err("backup.quota_gb", "the monthly quota must be between 1 and 10000 GB")
+    if not isinstance(b["reset_day"], int) or isinstance(b["reset_day"], bool) or not 1 <= b["reset_day"] <= 28:
+        err("backup.reset_day", "the reset day must be between 1 and 28")
 
     fw = cfg["firewall"]
     for k in ("wan_ping", "wan_ssh", "wan_web"):
@@ -281,18 +309,29 @@ VHT80_CENTER.update({c: 155 for c in (149, 153, 157, 161)})
 HT40_PLUS_5G = {36, 44, 52, 60, 100, 108, 116, 124, 132, 140, 149, 157}
 
 
-def iw_phy_info():
+def phy_of(iface):
+    """Name of the wiphy behind a network interface, None if it is not there."""
     try:
-        return subprocess.run(["iw", "phy"], capture_output=True, text=True, timeout=5).stdout
+        return os.path.basename(os.path.realpath(f"/sys/class/net/{iface}/phy80211"))
+    except OSError:
+        return None
+
+
+def iw_phy_info(iface=None):
+    """`iw` description of the radio behind iface (of every radio if unknown)."""
+    phy = phy_of(iface) if iface else None
+    argv = ["iw", "phy", phy, "info"] if phy and os.path.isdir(f"/sys/class/ieee80211/{phy}") else ["iw", "phy"]
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, timeout=5).stdout
     except (OSError, subprocess.TimeoutExpired):
         return ""
 
 
-def wifi_channels():
+def wifi_channels(iface=None):
     """Channels the radio may use as an access point (no radar/no-IR)."""
     out = {}
     band = None
-    for line in iw_phy_info().splitlines():
+    for line in iw_phy_info(iface).splitlines():
         m = re.match(r"\s*Band (\d):", line)
         if m:
             band = {"1": "2", "2": "5"}.get(m.group(1))
@@ -314,11 +353,11 @@ VHT_FLAGS = [(0x0010, "[RXLDPC]"), (0x0020, "[SHORT-GI-80]"), (0x0080, "[TX-STBC
              (0x10000000, "[RX-ANTENNA-PATTERN]"), (0x20000000, "[TX-ANTENNA-PATTERN]")]
 
 
-def radio_caps(band):
+def radio_caps(band, iface=None):
     """(ht_capab bits, vht_capab bits) of the radio for a band, from iw."""
     ht = vht = None
     cur = None
-    for line in iw_phy_info().splitlines():
+    for line in iw_phy_info(iface).splitlines():
         m = re.match(r"\s*Band (\d):", line)
         if m:
             cur = {"1": "2", "2": "5"}.get(m.group(1))
@@ -334,8 +373,8 @@ def radio_caps(band):
     return ht, vht
 
 
-def ht_capab(band, channel, width):
-    ht, _ = radio_caps(band)
+def ht_capab(band, channel, width, iface=None):
+    ht, _ = radio_caps(band, iface)
     if ht is None:
         ht = 0x19ef			# QCA988x
     s = "".join(f for bit, f in HT_FLAGS if ht & bit)
@@ -352,8 +391,8 @@ def ht_capab(band, channel, width):
     return s
 
 
-def vht_capab():
-    _, v = radio_caps("5")
+def vht_capab(iface=None):
+    _, v = radio_caps("5", iface)
     if v is None:
         v = 0x338001b2			# QCA988x
     s = ["", "[MAX-MPDU-7991]", "[MAX-MPDU-11454]", ""][v & 3]
@@ -392,6 +431,7 @@ def render(cfg):
     files = {}
     port, l2, l3 = wan_names(cfg)
     wan, lan, w = cfg["wan"], cfg["lan"], cfg["wifi"]
+    backup = cfg["backup"]["enabled"]
     mtu = [("MTUBytes", wan["mtu"])] if wan["mtu"] else []
 
     def wan_ip_sections(dev):
@@ -436,6 +476,16 @@ def render(cfg):
             files[f"{NET}/31-vc-wan-vlan.network"] = ini(wan_ip_sections(l2))
         else:
             files[name] = ini(wan_ip_sections(p))
+
+    if backup:
+        # Higher metric than the main WAN: only used when that has no route at
+        # all.  velocloud-wanwatch takes it over when the main WAN has a link
+        # but no Internet.  It brings the link up and down itself (quota).
+        files[f"{NET}/35-vc-usbwan.network"] = ini([
+            ("Match", [("Name", BACKUP)]),
+            ("Network", [("DHCP", "ipv4"), ("LinkLocalAddressing", "no"), ("IPv6AcceptRA", "no")]),
+            ("DHCPv4", [("UseHostname", "no"), ("RouteMetric", 4096), ("UseNTP", "no")]),
+            ("Link", [("ActivationPolicy", "manual"), ("RequiredForOnline", "no")])])
 
     br = [("Address", f"{lan['address']}/{lan['prefix']}"), ("ConfigureWithoutCarrier", "yes")]
     if lan["ipv6"]:
@@ -491,11 +541,12 @@ dhcp-option=option:dns-server,{lan['address']}
         protos = ["tcp", "udp"] if f["proto"] == "tcp+udp" else [f["proto"]]
         for proto in protos:
             dnat.append(f"iifname $WAN {proto} dport {ports} dnat to {to} comment \"{f.get('name', '')[:40]}\"")
-    mss = "\t\ttcp flags syn tcp option maxseg size set rt mtu\n" if wan["mode"] == "pppoe" or wan["mtu"] else ""
+    mss = "\t\ttcp flags syn tcp option maxseg size set rt mtu\n" if wan["mode"] == "pppoe" or wan["mtu"] or backup else ""
     nft = f"""#!/usr/sbin/nft -f
 {HEADER}flush ruleset
 
 define WAN = "{l3}"
+define WANS = {{ {', '.join(f'"{i}"' for i in ([l3] + ([BACKUP] if backup else [])))} }}
 define LAN = "br-lan"
 
 table inet filter {{
@@ -513,7 +564,7 @@ table inet filter {{
 		type filter hook forward priority filter; policy drop;
 {mss}		ct state established,related accept
 		ct state invalid drop
-		iifname $LAN oifname $WAN accept
+		iifname $LAN oifname $WANS accept
 		ct status dnat accept
 		icmpv6 type {{ destination-unreachable, packet-too-big, time-exceeded, parameter-problem, echo-request }} accept
 	}}
@@ -530,16 +581,16 @@ table ip nat {{
 
 	chain postrouting {
 		type nat hook postrouting priority srcnat; policy accept;
-		oifname $WAN masquerade
+		oifname $WANS masquerade
 	}
 }
 """
     files["/etc/nftables.conf"] = nft
     files[ETC + "/flowtable.devices"] = " ".join([port] + [p for p in PORTS if cfg["ports"][p] == "lan"]) + "\n"
 
-    # Wi-Fi
-    if w["enabled"]:
-        h = HEADER + f"""interface={WLAN}
+    # Wi-Fi: one hostapd per radio, same name and security on both
+    def hostapd_conf(iface, band, channel, width):
+        h = HEADER + f"""interface={iface}
 bridge=br-lan
 driver=nl80211
 ctrl_interface=/run/hostapd
@@ -549,18 +600,18 @@ utf8_ssid=1
 ignore_broadcast_ssid={1 if w['hidden'] else 0}
 country_code={w['country']}
 ieee80211d=1
-channel={w['channel']}
+channel={channel}
 ieee80211n=1
-ht_capab={ht_capab(w['band'], w['channel'], w['width'])}
+ht_capab={ht_capab(band, channel, width, iface)}
 wmm_enabled=1
 """
-        if w["band"] == "5":
+        if band == "5":
             h += "hw_mode=a\nieee80211ac=1\n"
-            if w["width"] == 80:
-                h += f"vht_oper_chwidth=1\nvht_oper_centr_freq_seg0_idx={VHT80_CENTER[w['channel']]}\n"
+            if width == 80:
+                h += f"vht_oper_chwidth=1\nvht_oper_centr_freq_seg0_idx={VHT80_CENTER[channel]}\n"
             else:
                 h += "vht_oper_chwidth=0\n"
-            h += f"vht_capab={vht_capab()}\n"
+            h += f"vht_capab={vht_capab(iface)}\n"
         else:
             h += "hw_mode=g\n"
         h += "auth_algs=1\nwpa=2\nrsn_pairwise=CCMP\nieee80211w=1\n"
@@ -581,7 +632,13 @@ acct_server_addr=127.0.0.1
 acct_server_port=1813
 acct_server_shared_secret={secret}
 """
-        files["/etc/hostapd/hostapd.conf"] = h
+        return h
+
+    if w["enabled"]:
+        files["/etc/hostapd/hostapd.conf"] = hostapd_conf(WLAN, w["band"], w["channel"], w["width"])
+        if cfg["wifi2"]["enabled"]:
+            files["/etc/hostapd/hostapd-2g.conf"] = hostapd_conf(WLAN2, "2", cfg["wifi2"]["channel"],
+                                                                 cfg["wifi2"]["width"])
 
     # PPPoE
     if wan["mode"] == "pppoe":
@@ -642,9 +699,10 @@ def radius_secret():
 
 LEGACY = [f"{NET}/30-lan-ports.network", f"{NET}/40-br-lan.network", f"{NET}/50-wan.network",
           "/etc/dnsmasq.d/lan.conf"]
-SECRET_FILES = ("/etc/ppp/chap-secrets", "/etc/ppp/pap-secrets", "/etc/hostapd/hostapd.conf")
+SECRET_FILES = ("/etc/ppp/chap-secrets", "/etc/ppp/pap-secrets", "/etc/hostapd/hostapd.conf",
+                "/etc/hostapd/hostapd-2g.conf")
 # removed when the configuration no longer needs them
-OPTIONAL = ("/etc/hostapd/hostapd.conf", "/etc/ppp/peers/velocloud-wan",
+OPTIONAL = ("/etc/hostapd/hostapd.conf", "/etc/hostapd/hostapd-2g.conf", "/etc/ppp/peers/velocloud-wan",
             "/etc/ppp/chap-secrets", "/etc/ppp/pap-secrets", ETC + "/wan-dns")
 
 
@@ -732,6 +790,15 @@ def restart_services(cfg, old, changed):
     elif service_active("hostapd") or service_enabled("hostapd"):
         run("systemctl", "disable", "--now", "hostapd")
         done.append("wifi")
+    if cfg["wifi"]["enabled"] and cfg["wifi2"]["enabled"]:
+        if "/etc/hostapd/hostapd-2g.conf" in changed or not service_active("hostapd-2g"):
+            run("systemctl", "enable", "hostapd-2g")
+            if os.path.exists(f"/sys/class/net/{WLAN2}"):
+                run("systemctl", "restart", "hostapd-2g")
+            done.append("wifi2")
+    elif service_active("hostapd-2g") or service_enabled("hostapd-2g"):
+        run("systemctl", "disable", "--now", "hostapd-2g")
+        done.append("wifi2")
     # FreeRADIUS only runs for the Enterprise Wi-Fi
     radius_on = cfg["wifi"]["enabled"] and cfg["wifi"]["security"] == "enterprise"
     if radius_on and not service_active("freeradius"):
@@ -740,6 +807,17 @@ def restart_services(cfg, old, changed):
     elif not radius_on and (service_active("freeradius") or service_enabled("freeradius")):
         run("systemctl", "disable", "--now", "freeradius")
         done.append("radius")
+    watch = "velocloud-wanwatch"
+    if cfg["backup"]["enabled"]:
+        if not service_enabled(watch):
+            run("systemctl", "enable", "--now", watch)
+            done.append("backup")
+        elif f"{NET}/35-vc-usbwan.network" in changed:
+            run("systemctl", "restart", watch)
+            done.append("backup")
+    elif service_active(watch) or service_enabled(watch):
+        run("systemctl", "disable", "--now", watch)
+        done.append("backup")
     ppp = "ppp@velocloud-wan"
     if cfg["wan"]["mode"] == "pppoe":
         if changed & {"/etc/ppp/peers/velocloud-wan", "/etc/ppp/chap-secrets", ETC + "/wan-dns"} \

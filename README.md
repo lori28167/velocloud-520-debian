@@ -36,6 +36,17 @@ firewall. Underneath it is plain Debian: `apt`, systemd, DKMS, nothing forked.
     range and fixed addresses;
   - Wi-Fi: 2.4 or 5 GHz, channel and width, WPA2/WPA3 with a password or
     WPA2/WPA3-Enterprise with one account per person;
+    with a MediaTek MT7601U USB adapter plugged in, a second 2.4 GHz radio with the
+    same name and security (the devices see one network and pick the band);
+  - WAN profiles: pick TIM, Vodafone, WINDTRE, Eolo or another Open Fiber operator (PPPoE) or plain
+    DHCP and the connection type and VLAN are filled in; the PPPoE user and password are
+    the ones of your contract. The values are the ones the operators publish for free modems
+    and should be checked with yours;
+  - backup Internet: a USB hotspot with USB tethering (RNDIS/CDC) becomes `usbwan`; when the
+    main line has no Internet (checked by ping, not just by the link) the router switches to it
+    and goes back a minute after the main line recovers. Every byte through it is counted per
+    month, router included, and at the limit (50 GB by default) the hotspot is switched off
+    until the reset day;
   - firewall: access from the Internet and port forwarding;
   - LED: colour of the front logo (previewed live on the box) and switch-off at night.
 - **Safe changes.** Every change is applied with a countdown: if you do not confirm

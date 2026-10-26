@@ -116,26 +116,55 @@ def wifi(cfg):
     m = re.search(r"txpower ([\d.]+) dBm", info)
     if m:
         w["txpower"] = float(m.group(1))
+    w["radio2"] = {"present": os.path.exists("/sys/class/net/wlan1"),
+                   "running": subprocess.run(["systemctl", "is-active", "--quiet", "hostapd-2g"]).returncode == 0}
+    m = re.search(r"channel (\d+) \((\d+) MHz\), width: (\d+) MHz", cmd("iw", "dev", "wlan1", "info"))
+    if m:
+        w["radio2"].update(channel=int(m.group(1)), freq=int(m.group(2)), width=int(m.group(3)))
     users = {}
-    for blk in cmd("hostapd_cli", "-p", "/run/hostapd", "all_sta").split("\n\n"):
+    for blk in "\n\n".join(cmd("hostapd_cli", "-p", "/run/hostapd", "-i", i, "all_sta")
+                           for i in ("wlan0", "wlan1")).split("\n\n"):
         mac = re.match(r"([0-9a-f:]{17})", blk.strip())
         user = re.search(r"dot1xAuthSessionUserName=(.+)", blk)
         if mac and user:
             users[mac.group(1)] = user.group(1).strip()
-    for blk in re.split(r"^Station ", cmd("iw", "dev", "wlan0", "station", "dump"), flags=re.M)[1:]:
-        mac = blk.split()[0]
-        def field(name):
-            m = re.search(rf"{name}:\s*(.+)", blk)
-            return m.group(1).strip() if m else ""
-        sig = re.match(r"(-?\d+)", field("signal"))
-        w["clients"].append({
-            "mac": mac, "user": users.get(mac, ""),
-            "signal": int(sig.group(1)) if sig else None,
-            "rx_rate": field("rx bitrate").split(" MBit/s")[0],
-            "tx_rate": field("tx bitrate").split(" MBit/s")[0],
-            "connected": int(field("connected time").split()[0] or 0) if field("connected time") else 0,
-        })
+    for iface in ("wlan0", "wlan1"):
+        if not os.path.exists(f"/sys/class/net/{iface}"):
+            continue
+        freq = re.search(r"channel \d+ \((\d+) MHz\)", cmd("iw", "dev", iface, "info"))
+        band = "2.4" if freq and int(freq.group(1)) < 3000 else "5"
+        for blk in re.split(r"^Station ", cmd("iw", "dev", iface, "station", "dump"), flags=re.M)[1:]:
+            mac = blk.split()[0]
+            def field(name):
+                m = re.search(rf"{name}:\s*(.+)", blk)
+                return m.group(1).strip() if m else ""
+            sig = re.match(r"(-?\d+)", field("signal"))
+            w["clients"].append({
+                "mac": mac, "user": users.get(mac, ""), "band": band,
+                "signal": int(sig.group(1)) if sig else None,
+                "rx_rate": field("rx bitrate").split(" MBit/s")[0],
+                "tx_rate": field("tx bitrate").split(" MBit/s")[0],
+                "connected": int(field("connected time").split()[0] or 0) if field("connected time") else 0,
+            })
     return w
+
+
+def backup(cfg, addrs, route):
+    """USB hotspot used as backup Internet: state kept by velocloud-wanwatch."""
+    b = cfg.get("backup", {})
+    out = {"enabled": bool(b.get("enabled")), "state": "off", "present": False, "used": 0,
+           "quota": b.get("quota_gb", 50) * 1_000_000_000, "addresses": addrs.get("usbwan", []),
+           "in_use": route["dev"] == "usbwan"}
+    if not out["enabled"]:
+        return out
+    try:
+        with open("/run/velocloud/backup.json") as f:
+            st = json.load(f)
+        out.update(state=st["state"], present=st["present"], used=st["used"], quota=st["quota"],
+                   period=st["period"])
+    except (OSError, ValueError, KeyError):
+        out["state"] = "starting"
+    return out
 
 
 def wifi_channels():
@@ -146,7 +175,11 @@ def wifi_channels():
         spec = importlib.util.spec_from_loader("vapply", loader)
         mod = importlib.util.module_from_spec(spec)
         loader.exec_module(mod)
-        return mod.wifi_channels()
+        chans = mod.wifi_channels(mod.WLAN)
+        usb = mod.wifi_channels(mod.WLAN2).get("2")
+        if usb:
+            chans["usb"] = usb		# channels of the 2.4 GHz USB adapter
+        return chans
     except Exception:
         return {}
 
@@ -232,6 +265,7 @@ def main():
         "lan": {"addresses": addrs.get("br-lan", []), "counters": iface("br-lan")},
         "leases": leases(),
         "wifi": wifi(cfg),
+        "backup": backup(cfg, addrs, route),
         "led": led(),
         "pending_until": int(pending) if pending.isdigit() else None,
     }

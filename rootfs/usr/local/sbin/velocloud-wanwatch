@@ -1,0 +1,204 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-2.0-only
+"""Backup Internet over the USB hotspot (interface usbwan).
+
+* Every few seconds pings a few public addresses through the main WAN.  After
+  FAIL_AFTER misses in a row the default route of the hotspot is given a lower
+  metric than the main one, after BACK_AFTER hits in a row it is taken away.
+  (If the main WAN link goes down altogether the kernel already falls back to
+  the hotspot's high-metric route that systemd-networkd installs.)
+* Counts every byte through the hotspot, in both directions and router
+  included, per billing month (resets on backup.reset_day).  At quota_gb the
+  link is brought down and stays down until the next period: a hard stop.
+
+State for the web interface: /run/velocloud/backup.json
+Usage counter that survives reboots: /var/lib/velocloud/backup-usage.json
+"""
+import datetime
+import importlib.machinery
+import importlib.util
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+
+CONFIG = "/etc/velocloud/router.json"
+STATE = "/run/velocloud/backup.json"
+USAGE = "/var/lib/velocloud/backup-usage.json"
+IFACE = "usbwan"
+TARGETS = ("1.1.1.1", "8.8.8.8", "9.9.9.9")
+INTERVAL = 5		# seconds between checks
+FAIL_AFTER = 3		# misses in a row before taking over
+BACK_AFTER = 12		# hits in a row (about a minute) before giving back
+FAILOVER_METRIC = 50
+GB = 1_000_000_000	# decimal, so that we stop a little before an operator counting GiB
+
+
+def run(*argv, timeout=10):
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return subprocess.CompletedProcess(argv, 1, "", "")
+
+
+def load_apply():
+    loader = importlib.machinery.SourceFileLoader("vapply", "/usr/local/sbin/velocloud-apply")
+    spec = importlib.util.spec_from_loader("vapply", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def period_key(today, reset_day):
+    """Billing period the day belongs to, named after the day it started."""
+    d = today if today.day >= reset_day else (today.replace(day=1) - datetime.timedelta(days=1))
+    return f"{d.year:04d}-{d.month:02d}-{reset_day:02d}"
+
+
+def read_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def write_json(path, obj):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f)
+    os.replace(tmp, path)
+
+
+def counters():
+    try:
+        r = int(open(f"/sys/class/net/{IFACE}/statistics/rx_bytes").read())
+        t = int(open(f"/sys/class/net/{IFACE}/statistics/tx_bytes").read())
+        return r + t
+    except (OSError, ValueError):
+        return None
+
+
+def reachable(dev):
+    for ip in TARGETS:
+        if run("ping", "-I", dev, "-c", "1", "-W", "2", ip, timeout=5).returncode == 0:
+            return True
+    return False
+
+
+def gateway():
+    for r in json.loads(run("ip", "-j", "route", "show", "default", "dev", IFACE).stdout or "[]"):
+        if r.get("gateway") and r.get("metric") != FAILOVER_METRIC:
+            return r["gateway"]
+    return None
+
+
+def has_failover_route():
+    return any(r.get("metric") == FAILOVER_METRIC
+               for r in json.loads(run("ip", "-j", "route", "show", "default", "dev", IFACE).stdout or "[]"))
+
+
+def drop_failover_route():
+    while has_failover_route():
+        if run("ip", "route", "del", "default", "dev", IFACE, "metric", str(FAILOVER_METRIC)).returncode:
+            break
+
+
+def link_state():
+    try:
+        flags = int(open(f"/sys/class/net/{IFACE}/flags").read(), 16)
+    except (OSError, ValueError):
+        return None
+    return bool(flags & 1)		# IFF_UP
+
+
+class Watch:
+    def __init__(self):
+        self.vapply = load_apply()
+        self.misses = self.hits = 0
+        self.failed_over = False
+        self.last_counter = None
+        self.stop = False
+
+    def main_dev(self, cfg):
+        return self.vapply.wan_names(cfg)[2]
+
+    def account(self, usage, today, reset_day):
+        key = period_key(today, reset_day)
+        if usage.get("period") != key:
+            usage.update(period=key, bytes=0, exceeded=False)
+        now = counters()
+        if now is not None:
+            # the counters restart from zero when the hotspot is plugged again
+            if self.last_counter is not None:
+                usage["bytes"] += now - self.last_counter if now >= self.last_counter else now
+            self.last_counter = now
+        else:
+            self.last_counter = None
+        return usage
+
+    def step(self):
+        cfg = self.vapply.load(CONFIG)
+        b = cfg["backup"]
+        usage = read_json(USAGE, {})
+        before = dict(usage)
+        usage = self.account(usage, datetime.date.today(), b["reset_day"])
+        quota = b["quota_gb"] * GB
+        usage["exceeded"] = usage["bytes"] >= quota		# raising the quota resumes at once
+
+        present = link_state() is not None
+        if usage["exceeded"]:
+            # hard stop until the next period
+            drop_failover_route()
+            self.failed_over = False
+            if link_state():
+                run("ip", "link", "set", IFACE, "down")
+            state = "quota"
+        elif not present:
+            self.failed_over = False
+            state = "absent"
+        else:
+            if not link_state():
+                run("ip", "link", "set", IFACE, "up")
+            if reachable(self.main_dev(cfg)):
+                self.hits += 1
+                self.misses = 0
+            else:
+                self.misses += 1
+                self.hits = 0
+            if not self.failed_over and self.misses >= FAIL_AFTER:
+                gw = gateway()
+                if gw and run("ip", "route", "replace", "default", "via", gw, "dev", IFACE,
+                              "metric", str(FAILOVER_METRIC)).returncode == 0:
+                    self.failed_over = True
+            elif self.failed_over and self.hits >= BACK_AFTER:
+                drop_failover_route()
+                self.failed_over = False
+            state = "active" if self.failed_over else "standby"
+
+        if usage != before:
+            write_json(USAGE, usage)
+        write_json(STATE, {"state": state, "present": present, "used": usage["bytes"], "quota": quota,
+                           "period": usage["period"], "reset_day": b["reset_day"],
+                           "updated": int(time.time())})
+
+    def run(self):
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            signal.signal(sig, lambda *a: setattr(self, "stop", True))
+        while not self.stop:
+            try:
+                self.step()
+            except Exception as e:		# keep watching whatever happens
+                print(f"velocloud-wanwatch: {e}", file=sys.stderr, flush=True)
+            for _ in range(INTERVAL * 2):
+                if self.stop:
+                    break
+                time.sleep(0.5)
+        drop_failover_route()
+
+
+if __name__ == "__main__":
+    Watch().run()
