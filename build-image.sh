@@ -16,7 +16,7 @@ PKGS="systemd-sysv,systemd-resolved,systemd-timesyncd,udev,dbus,kmod,
 linux-image-amd64,linux-headers-amd64,dkms,initramfs-tools,zstd,grub-pc,
 openssh-server,nftables,dnsmasq,iproute2,iputils-ping,ethtool,tcpdump,curl,
 ca-certificates,nano,less,htop,procps,psmisc,pciutils,usbutils,lm-sensors,
-irqbalance,iw,wireless-regdb,hostapd,firmware-atheros,fish,bash-completion,
+irqbalance,iw,wireless-regdb,hostapd,firmware-atheros,firmware-mediatek,fish,bash-completion,
 rsync,fdisk,e2fsprogs,util-linux,tzdata,python3,openssl,
 cockpit-ws,cockpit-bridge,cockpit-system,freeradius,freeradius-utils,eapoltest,ppp"
 
@@ -78,6 +78,11 @@ echo "== velocloud-igb DKMS"
 "$W/driver/mkdkms.sh" /usr/src/linux-source-6.12.tar.xz "$R/usr/src/velocloud-igb-$VER" "$VER"
 chroot "$R" dkms add velocloud-igb/$VER
 chroot "$R" dkms install velocloud-igb/$VER -k "$KVER"
+
+echo "== velocloud-mt7601u DKMS (USB Wi-Fi adapter as access point)"
+"$W/driver/mkdkms-mt7601u.sh" /usr/src/linux-source-6.12.tar.xz "$R/usr/src/velocloud-mt7601u-$VER" "$VER"
+chroot "$R" dkms add velocloud-mt7601u/$VER
+chroot "$R" dkms install velocloud-mt7601u/$VER -k "$KVER"
 ls -l "$R/lib/modules/$KVER/updates/dkms/"
 
 echo "== router configuration (router.json defaults -> system files)"

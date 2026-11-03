@@ -1,0 +1,283 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-2.0-only
+"""Internet lines: health checks, failover, load sharing and the USB hotspot.
+
+Lines: the main WAN, an optional second WAN (port with role wan2) and an
+optional USB hotspot (interface usbwan, the backup of last resort).
+
+* Every few seconds pings a few public addresses through each line.  A line
+  becomes unhealthy after FAIL_AFTER misses in a row and healthy again after
+  BACK_AFTER hits in a row.
+* With two lines the default route with metric 50 is owned by this program:
+  - multiwan.mode failover: the first healthy line (main, then second);
+  - multiwan.mode balance: both healthy lines at once, one connection on one
+    line, shared by the weights (a single download still uses a single line);
+  - when only the hotspot is left and has quota, the hotspot.
+  With one line the route is only set while the hotspot has to take over.
+  If this program is not running, the routes of systemd-networkd (metric 1024
+  main, 2048 second, 4096 hotspot) still give a plain failover on link loss.
+* Counts every byte through the hotspot, in both directions and router
+  included, per billing month (resets on backup.reset_day).  At quota_gb the
+  link is brought down and stays down until the next period: a hard stop.
+
+State for the web interface: /run/velocloud/backup.json (hotspot) and
+/run/velocloud/wan.json (lines).  Usage counter that survives reboots:
+/var/lib/velocloud/backup-usage.json
+"""
+import datetime
+import importlib.machinery
+import importlib.util
+import json
+import os
+import signal
+import subprocess
+import sys
+import time
+
+CONFIG = "/etc/velocloud/router.json"
+STATE = "/run/velocloud/backup.json"
+LINES = "/run/velocloud/wan.json"
+USAGE = "/var/lib/velocloud/backup-usage.json"
+IFACE = "usbwan"
+TARGETS = ("1.1.1.1", "8.8.8.8", "9.9.9.9")
+INTERVAL = 5		# seconds between checks
+FAIL_AFTER = 3		# misses in a row before a line is given up
+BACK_AFTER = 12		# hits in a row (about a minute) before it is trusted again
+MANAGED_METRIC = 50
+GB = 1_000_000_000	# decimal, so that we stop a little before an operator counting GiB
+
+
+def run(*argv, timeout=10):
+    try:
+        return subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    except (OSError, subprocess.TimeoutExpired):
+        return subprocess.CompletedProcess(argv, 1, "", "")
+
+
+def load_apply():
+    loader = importlib.machinery.SourceFileLoader("vapply", "/usr/local/sbin/velocloud-apply")
+    spec = importlib.util.spec_from_loader("vapply", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def period_key(today, reset_day):
+    """Billing period the day belongs to, named after the day it started."""
+    d = today if today.day >= reset_day else (today.replace(day=1) - datetime.timedelta(days=1))
+    return f"{d.year:04d}-{d.month:02d}-{reset_day:02d}"
+
+
+def read_json(path, default):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def write_json(path, obj):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(obj, f)
+    os.replace(tmp, path)
+
+
+def counters():
+    try:
+        r = int(open(f"/sys/class/net/{IFACE}/statistics/rx_bytes").read())
+        t = int(open(f"/sys/class/net/{IFACE}/statistics/tx_bytes").read())
+        return r + t
+    except (OSError, ValueError):
+        return None
+
+
+def reachable(dev):
+    for ip in TARGETS:
+        if run("ping", "-I", dev, "-c", "1", "-W", "2", ip, timeout=5).returncode == 0:
+            return True
+    return False
+
+
+def default_routes():
+    try:
+        return json.loads(run("ip", "-j", "route", "show", "default").stdout or "[]")
+    except ValueError:
+        return []
+
+
+def gateways():
+    """{device: gateway or ""} of the routes of networkd/pppd, not our own."""
+    out = {}
+    for r in default_routes():
+        if r.get("metric") != MANAGED_METRIC and r.get("dev") and r["dev"] not in out:
+            out[r["dev"]] = r.get("gateway", "")
+    return out
+
+
+def managed_exists():
+    return any(r.get("metric") == MANAGED_METRIC for r in default_routes())
+
+
+def drop_managed_route():
+    while managed_exists():
+        if run("ip", "route", "del", "default", "metric", str(MANAGED_METRIC)).returncode:
+            break
+
+
+def set_managed_route(hops):
+    """hops: [(device, gateway, weight)]; one hop is a plain route, more are shared."""
+    def nh(dev, gw):
+        return (["via", gw] if gw else []) + ["dev", dev]
+    if len(hops) == 1:
+        dev, gw, _ = hops[0]
+        argv = ["ip", "route", "replace", "default"] + nh(dev, gw) + ["metric", str(MANAGED_METRIC)]
+    else:
+        argv = ["ip", "route", "replace", "default", "metric", str(MANAGED_METRIC)]
+        for dev, gw, weight in hops:
+            argv += ["nexthop"] + nh(dev, gw) + ["weight", str(weight)]
+    return run(*argv).returncode == 0
+
+
+def link_state():
+    try:
+        flags = int(open(f"/sys/class/net/{IFACE}/flags").read(), 16)
+    except (OSError, ValueError):
+        return None
+    return bool(flags & 1)		# IFF_UP
+
+
+class Line:
+    def __init__(self, dev):
+        self.dev = dev
+        self.healthy = None		# unknown until the first probe
+        self.misses = self.hits = 0
+
+    def probe(self, usable):
+        ok = usable and reachable(self.dev)
+        if ok:
+            self.hits += 1
+            self.misses = 0
+        else:
+            self.misses += 1
+            self.hits = 0
+        if self.healthy is None:
+            self.healthy = ok
+        elif self.healthy and self.misses >= FAIL_AFTER:
+            self.healthy = False
+        elif not self.healthy and self.hits >= BACK_AFTER:
+            self.healthy = True
+        return self.healthy
+
+
+class Watch:
+    def __init__(self):
+        self.vapply = load_apply()
+        self.lines = {}
+        self.last_counter = None
+        self.stop = False
+        self.wanted = None		# what the managed route should look like
+
+    def account(self, usage, today, reset_day):
+        key = period_key(today, reset_day)
+        if usage.get("period") != key:
+            usage.update(period=key, bytes=0, exceeded=False)
+        now = counters()
+        if now is not None:
+            # the counters restart from zero when the hotspot is plugged again
+            if self.last_counter is not None:
+                usage["bytes"] += now - self.last_counter if now >= self.last_counter else now
+            self.last_counter = now
+        else:
+            self.last_counter = None
+        return usage
+
+    def hotspot(self, cfg):
+        """Quota and link of the hotspot.  Returns (state, usable, usage)."""
+        b = cfg["backup"]
+        if not b["enabled"]:
+            return "off", False, None
+        usage = read_json(USAGE, {})
+        before = dict(usage)
+        usage = self.account(usage, datetime.date.today(), b["reset_day"])
+        quota = b["quota_gb"] * GB
+        usage["exceeded"] = usage["bytes"] >= quota		# raising the quota resumes at once
+        present = link_state() is not None
+        if usage["exceeded"]:
+            # hard stop until the next period
+            if link_state():
+                run("ip", "link", "set", IFACE, "down")
+            state, usable = "quota", False
+        elif not present:
+            state, usable = "absent", False
+        else:
+            if not link_state():
+                run("ip", "link", "set", IFACE, "up")
+            state, usable = "standby", True
+        if usage != before:
+            write_json(USAGE, usage)
+        return state, usable, {"present": present, "used": usage["bytes"], "quota": quota,
+                               "period": usage["period"], "reset_day": b["reset_day"]}
+
+    def step(self):
+        cfg = self.vapply.load(CONFIG)
+        mw = cfg["multiwan"]
+        names = [self.vapply.wan_names(cfg)[2]]
+        second = self.vapply.wan2_names(cfg)
+        if second:
+            names.append(second[2])
+        weights = dict(zip(names, (mw["weight1"], mw["weight2"])))
+        self.lines = {d: self.lines.get(d) or Line(d) for d in names}
+
+        state, hotspot_usable, usage = self.hotspot(cfg)
+        gws = gateways()
+        for dev, line in self.lines.items():
+            line.probe(dev in gws or dev.startswith("ppp"))
+        healthy = [d for d in names if self.lines[d].healthy]
+
+        hops = None
+        if healthy:
+            if second:
+                if mw["mode"] == "balance" and len(healthy) > 1:
+                    hops = [(d, gws.get(d, ""), weights[d]) for d in healthy]
+                else:
+                    hops = [(healthy[0], gws.get(healthy[0], ""), 1)]
+            # a single line is left to the routes of systemd-networkd
+        elif hotspot_usable and IFACE in gws:
+            hops = [(IFACE, gws[IFACE], 1)]
+        if hops is None:
+            drop_managed_route()
+            self.wanted = None
+        elif hops != self.wanted or not managed_exists():
+            self.wanted = hops if set_managed_route(hops) else None
+
+        if usage is not None:
+            using = state == "standby" and bool(self.wanted) and self.wanted[0][0] == IFACE
+            write_json(STATE, {"state": "active" if using else state, "present": usage["present"],
+                               "used": usage["used"], "quota": usage["quota"], "period": usage["period"],
+                               "reset_day": usage["reset_day"], "updated": int(time.time())})
+        elif os.path.exists(STATE):
+            os.remove(STATE)
+        write_json(LINES, {
+            "mode": mw["mode"] if second else "single",
+            "lines": [{"dev": d, "healthy": bool(self.lines[d].healthy), "weight": weights[d]} for d in names],
+            "using": [h[0] for h in (self.wanted or [])], "updated": int(time.time())})
+
+    def run(self):
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            signal.signal(sig, lambda *a: setattr(self, "stop", True))
+        while not self.stop:
+            try:
+                self.step()
+            except Exception as e:		# keep watching whatever happens
+                print(f"velocloud-wanwatch: {e}", file=sys.stderr, flush=True)
+            for _ in range(INTERVAL * 2):
+                if self.stop:
+                    break
+                time.sleep(0.5)
+        drop_managed_route()
+
+
+if __name__ == "__main__":
+    Watch().run()

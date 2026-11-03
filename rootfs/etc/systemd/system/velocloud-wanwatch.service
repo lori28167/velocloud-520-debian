@@ -1,0 +1,12 @@
+[Unit]
+Description=Backup Internet over the USB hotspot: failover and monthly quota
+After=systemd-networkd.service network-online.target
+Wants=systemd-networkd.service
+
+[Service]
+ExecStart=/usr/local/sbin/velocloud-wanwatch
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,6 @@
+# USB hotspot with Internet over USB (RNDIS/CDC): named usbwan, used as backup WAN
+[Match]
+Driver=rndis_host cdc_ether cdc_ncm
+
+[Link]
+Name=usbwan

@@ -1,0 +1,19 @@
+[Unit]
+Description=Access point on the 2.4 GHz USB Wi-Fi adapter
+Documentation=man:hostapd(8)
+After=network.target freeradius.service sys-subsystem-net-devices-wlan1.device sys-subsystem-net-devices-br\x2dlan.device
+Wants=freeradius.service
+BindsTo=sys-subsystem-net-devices-wlan1.device
+ConditionFileNotEmpty=/etc/hostapd/hostapd-2g.conf
+
+[Service]
+Type=forking
+PIDFile=/run/hostapd-2g.pid
+Restart=on-failure
+RestartSec=2
+ExecStart=/usr/sbin/hostapd -B -P /run/hostapd-2g.pid /etc/hostapd/hostapd-2g.conf
+
+[Install]
+WantedBy=multi-user.target
+# started when the adapter is plugged in after boot
+WantedBy=sys-subsystem-net-devices-wlan1.device

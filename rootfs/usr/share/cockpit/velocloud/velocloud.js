@@ -81,6 +81,55 @@ const IT = {
     "WAN": "WAN",
     "Off": "Spenta",
     "Internet (WAN)": "Internet (WAN)",
+    "Internet 2 (WAN2)": "Internet 2 (WAN2)",
+    "One port connects to the Internet; a second one can be a second Internet line (WAN2). LAN ports are bridged together and with the Wi-Fi.":
+        "Una porta si collega a Internet; una seconda può essere una seconda linea Internet (WAN2). Le porte LAN sono unite fra loro e con il Wi-Fi.",
+    "Second Internet line (WAN2)": "Seconda linea Internet (WAN2)",
+    "0 = none.": "0 = nessuna.",
+    "Use of the two lines": "Uso delle due linee",
+    "Main line first, the second one if it fails": "Prima la linea principale, la seconda se cade",
+    "Both together: each connection uses one of them": "Insieme: ogni connessione usa una delle due",
+    "A single download never goes faster than one line; many connections together do.":
+        "Un singolo download non supera mai una linea sola; tante connessioni insieme sì.",
+    "Share of the main line": "Quota della linea principale",
+    "Share of the second line": "Quota della seconda linea",
+    "For example 3 and 1: three connections out of four on the main line.":
+        "Per esempio 3 e 1: tre connessioni su quattro sulla linea principale.",
+    "Internet 2": "Internet 2",
+    "Both together": "Insieme",
+    "Main line first": "Prima la principale",
+    "mode must be dhcp or static": "il tipo deve essere DHCP o statico",
+    "at most one port can be the second WAN": "al massimo una porta può essere la seconda WAN",
+    "the weight must be between 1 and 10": "la quota deve essere tra 1 e 10",
+    "mode must be failover or balance": "la modalità deve essere failover o bilanciamento",
+    "the two lines need different addresses": "le due linee devono avere indirizzi diversi",
+    "Operator profile": "Profilo operatore",
+    "Custom": "Personalizzato",
+    "DHCP, no VLAN": "DHCP, senza VLAN",
+    "TIM fibre (PPPoE, VLAN 835)": "TIM fibra (PPPoE, VLAN 835)",
+    "Eolo fibre (PPPoE, VLAN 835)": "Eolo fibra (PPPoE, VLAN 835)",
+    "Vodafone fibre (PPPoE, VLAN 1036)": "Vodafone fibra (PPPoE, VLAN 1036)",
+    "WINDTRE fibre (PPPoE, VLAN 835)": "WINDTRE fibra (PPPoE, VLAN 835)",
+    "Other operator on Open Fiber, PPPoE (VLAN 835)": "Altro operatore su Open Fiber, PPPoE (VLAN 835)",
+    "Other operator on Open Fiber, DHCP (VLAN 835)": "Altro operatore su Open Fiber, DHCP (VLAN 835)",
+    "Fills in connection type and VLAN. User name and password are in your contract or the operator's customer area. Check the values with your operator.":
+        "Compila tipo di connessione e VLAN. Utente e password sono nel contratto o nell'area clienti dell'operatore. Verifica i valori con il tuo operatore.",
+    "Backup Internet (USB hotspot)": "Internet di backup (hotspot USB)",
+    "Use the USB hotspot when the main line has no Internet": "Usa l'hotspot USB quando la linea principale non ha Internet",
+    "Monthly limit (GB)": "Limite mensile (GB)",
+    "The hotspot is switched off at this limit until the next period. Everything counts, router included.":
+        "A questo limite l'hotspot viene spento fino al periodo successivo. Conta tutto il traffico, router compreso.",
+    "Resets on day": "Si azzera il giorno",
+    "Backup Internet": "Internet di backup",
+    "no hotspot": "nessun hotspot",
+    "ready": "pronto",
+    "in use": "in uso",
+    "limit reached": "limite raggiunto",
+    "starting": "in avvio",
+    "Used this period": "Usati in questo periodo",
+    "Period started": "Periodo iniziato",
+    "the monthly quota must be between 1 and 10000 GB": "il limite mensile deve essere tra 1 e 10000 GB",
+    "the reset day must be between 1 and 28": "il giorno di azzeramento deve essere tra 1 e 28",
     "Port roles": "Ruolo delle porte",
     "Exactly one port connects to the Internet. LAN ports are bridged together and with the Wi-Fi.":
         "Una sola porta va verso Internet. Le porte LAN sono unite tra loro e con il Wi-Fi.",
@@ -121,6 +170,14 @@ const IT = {
     "Band": "Banda",
     "The radio works on one band at a time.": "La radio lavora su una banda alla volta.",
     "Channel width": "Larghezza canale",
+    "2.4 GHz radio (USB adapter)": "Radio 2,4 GHz (adattatore USB)",
+    "Also on 2.4 GHz": "Anche a 2,4 GHz",
+    "Same name and security as above: devices see a single network and pick the band themselves.":
+        "Stessi nome e sicurezza di sopra: i dispositivi vedono una sola rete e scelgono la banda da soli.",
+    "No USB Wi-Fi adapter found. It needs an adapter with the MediaTek MT7601U chip.":
+        "Nessun adattatore Wi-Fi USB trovato. Serve un adattatore con chip MediaTek MT7601U.",
+    "Available when the main Wi-Fi is on 5 GHz.": "Disponibile se il Wi-Fi principale è a 5 GHz.",
+    "2.4 GHz channel": "Canale 2,4 GHz",
     "Wider is faster, narrower reaches further.": "Più larga è più veloce, più stretta arriva più lontano.",
     "Country": "Paese",
     "Sets the legal channels and power.": "Determina canali e potenza consentiti.",
@@ -245,6 +302,11 @@ const IT = {
     "width must be 20 or 40 MHz (2.4 GHz) or 20/40/80 MHz (5 GHz)": "larghezza 20 o 40 MHz (2,4 GHz) o 20/40/80 MHz (5 GHz)",
     "channel must be a number": "il canale deve essere un numero",
     "no 80 MHz block for this channel": "nessun blocco da 80 MHz per questo canale",
+    "the 2.4 GHz radio shares the network of the main Wi-Fi: switch that on first":
+        "la radio 2,4 GHz condivide la rete del Wi-Fi principale: accendi prima quello",
+    "the main Wi-Fi must be on 5 GHz to add a 2.4 GHz radio":
+        "il Wi-Fi principale deve essere a 5 GHz per aggiungere una radio a 2,4 GHz",
+    "width must be 20 or 40 MHz": "la larghezza deve essere 20 o 40 MHz",
     "security must be enterprise or psk": "la sicurezza deve essere Enterprise o password",
     "the password needs 8-63 characters": "la password deve avere 8-63 caratteri",
     "new lines are not allowed": "gli a capo non sono ammessi",
@@ -429,6 +491,7 @@ function computeRates() {
     const r = (x, y) => (x && y ? { rx: Math.max(y.rx_bytes - x.rx_bytes, 0) * 8 / dt, tx: Math.max(y.tx_bytes - x.tx_bytes, 0) * 8 / dt } : null);
     S.rates.wan = r(a.wan.counters, b.wan.counters);
     S.rates.lan = r(a.lan.counters, b.lan.counters);
+    S.rates.wan2 = a.wan2 && b.wan2 ? r(a.wan2.counters, b.wan2.counters) : null;
 }
 
 async function loadUsers() {
@@ -715,11 +778,33 @@ function viewStatus() {
                     [_("To devices"), rate(S.rates.lan && S.rates.lan.tx)],
                     [_("From devices"), rate(S.rates.lan && S.rates.lan.rx)],
                 ])),
+            st.wan2 ? h("div", { class: "vc-card" },
+                h("h2", {}, _("Internet 2"), " ",
+                    h("span", { class: "vc-badge " + (st.wan2.online ? "ok" : "") }, st.wan2.online ? _("in use") : (st.lines && st.lines.lines.some(l => l.dev === st.wan2.dev && l.healthy) ? _("ready") : _("offline")))),
+                kv([
+                    [_("Port"), LABEL[st.wan2.port] + (st.wan2.dev !== st.wan2.port ? ` (${st.wan2.dev})` : "")],
+                    [_("Addresses"), st.wan2.addresses.length ? st.wan2.addresses.join(", ") : "–"],
+                    [_("Gateway"), st.wan2.gateway || "–"],
+                    [_("Use of the two lines"), (st.multiwan && st.multiwan.mode === "balance") ? _("Both together") : _("Main line first")],
+                    [_("Download"), rate(S.rates.wan2 && S.rates.wan2.rx)],
+                    [_("Upload"), rate(S.rates.wan2 && S.rates.wan2.tx)],
+                ])) : null,
+            st.backup && st.backup.enabled ? h("div", { class: "vc-card" },
+                h("h2", {}, _("Backup Internet"), " ",
+                    h("span", { class: "vc-badge " + (st.backup.state === "active" ? "warn" : st.backup.state === "standby" ? "ok" : st.backup.state === "quota" ? "bad" : "") },
+                        { absent: _("no hotspot"), standby: _("ready"), active: _("in use"), quota: _("limit reached"), starting: _("starting") }[st.backup.state] || st.backup.state)),
+                kv([
+                    [_("Used this period"), `${(st.backup.used / 1e9).toFixed(1)} / ${(st.backup.quota / 1e9).toFixed(0)} GB`],
+                    st.backup.period ? [_("Period started"), st.backup.period] : null,
+                    [_("Addresses"), st.backup.addresses.length ? st.backup.addresses.join(", ") : "–"],
+                ])) : null,
             h("div", { class: "vc-card" },
                 h("h2", {}, _("Wi-Fi"), " ", h("span", { class: "vc-badge " + (w.running ? "ok" : "") }, !w.present ? _("no card") : w.running ? _("on") : _("off"))),
                 w.present && w.running ? kv([
                     [_("Network name"), S.saved.wifi.ssid],
                     [_("Channel"), w.channel ? `${w.channel} (${w.freq} MHz, ${w.width} MHz)` : "–"],
+                    w.radio2 && w.radio2.running && w.radio2.channel
+                        ? [_("2.4 GHz channel"), `${w.radio2.channel} (${w.radio2.freq} MHz, ${w.radio2.width} MHz)`] : null,
                     [_("Transmit power"), w.txpower ? `${w.txpower} dBm` : "–"],
                     [_("Clients"), String(w.clients.length)],
                 ]) : null),
@@ -762,22 +847,61 @@ function viewStatus() {
 
 /* ---------------- network */
 
+function wanProfiles() {
+    return [
+        ["custom", _("Custom"), null],
+        ["dhcp", _("DHCP, no VLAN"), { mode: "dhcp", vlan: 0 }],
+        ["tim", _("TIM fibre (PPPoE, VLAN 835)"), { mode: "pppoe", vlan: 835 }],
+        ["eolo", _("Eolo fibre (PPPoE, VLAN 835)"), { mode: "pppoe", vlan: 835 }],
+        ["vodafone", _("Vodafone fibre (PPPoE, VLAN 1036)"), { mode: "pppoe", vlan: 1036, user: "vodafoneadsl", password: "vodafoneadsl" }],
+        ["windtre", _("WINDTRE fibre (PPPoE, VLAN 835)"), { mode: "pppoe", vlan: 835, user: "benvenuto", password: "ospite" }],
+        ["of-pppoe", _("Other operator on Open Fiber, PPPoE (VLAN 835)"), { mode: "pppoe", vlan: 835 }],
+        ["of-dhcp", _("Other operator on Open Fiber, DHCP (VLAN 835)"), { mode: "dhcp", vlan: 835 }],
+    ];
+}
+
+function wanProfileSelect() {
+    const list = wanProfiles();
+    const el = h("select", {}, list.map(([id, label]) => h("option", { value: id, selected: id === (S.wanProfile || "custom") }, label)));
+    el.addEventListener("change", () => {
+        S.wanProfile = el.value;
+        const p = list.find(x => x[0] === el.value)[2];
+        if (p) {
+            S.cfg.wan.mode = p.mode;
+            S.cfg.wan.vlan = p.vlan;
+            S.cfg.wan.mtu = 0;
+            // generic public credentials only where nothing personal would be lost
+            const generic = wanProfiles().map(x => x[2] && x[2].user).filter(Boolean);
+            if (p.user && (!S.cfg.wan.pppoe_user || generic.includes(S.cfg.wan.pppoe_user))) {
+                S.cfg.wan.pppoe_user = p.user;
+                S.cfg.wan.pppoe_password = p.password;
+            }
+            changed();
+        }
+        renderBody();
+    });
+    return el;
+}
+
 function viewNetwork() {
     const c = S.cfg;
     const wan = c.wan;
-    const roleOpts = [["lan", _("LAN")], ["wan", _("Internet (WAN)")], ["off", _("Off")]];
+    const roleOpts = [["lan", _("LAN")], ["wan", _("Internet (WAN)")], ["wan2", _("Internet 2 (WAN2)")], ["off", _("Off")]];
+    const wan2 = c.wan2;
+    const hasWan2 = PORTS.some(([dev]) => c.ports[dev] === "wan2");
     const prefixes = [16, 20, 21, 22, 23, 24, 25, 26, 27, 28].map(p => [p, `/${p}`]);
     const dh = c.lan.dhcp;
     return h("div", {},
         h("div", { class: "vc-card" },
             h("h2", {}, _("Port roles")),
-            h("p", { class: "vc-help" }, _("Exactly one port connects to the Internet. LAN ports are bridged together and with the Wi-Fi.")),
+            h("p", { class: "vc-help" }, _("One port connects to the Internet; a second one can be a second Internet line (WAN2). LAN ports are bridged together and with the Wi-Fi.")),
             h("div", { class: "vc-roles" }, PORTS.map(([dev, label]) =>
                 h("div", { class: "vc-role" }, h("span", {}, label), select("ports." + dev, roleOpts)))),
             errFor("ports") ? h("div", { class: "vc-error" }, errFor("ports")) : null),
         h("div", { class: "vc-card" },
             h("h2", {}, _("Internet (WAN)")),
             h("div", { class: "vc-form" },
+                row(_("Operator profile"), null, wanProfileSelect(), _("Fills in connection type and VLAN. User name and password are in your contract or the operator's customer area. Check the values with your operator.")),
                 row(_("Connection type"), "wan.mode", select("wan.mode",
                     [["dhcp", _("Automatic (DHCP)")], ["static", _("Static address")], ["pppoe", _("PPPoE (fibre/DSL with user name)")]],
                     { rerender: true })),
@@ -797,6 +921,36 @@ function viewNetwork() {
                     _("0 = none. Many Italian fibre lines need 835 when the router connects directly to the ONT.")),
                 row(_("MTU"), "wan.mtu", input("wan.mtu", { type: "number", number: true, min: 0, max: 9000 }), _("0 = automatic")),
                 row(_("IPv6"), "wan.ipv6", checkbox("wan.ipv6", _("Use IPv6"))))),
+        hasWan2 ? h("div", { class: "vc-card" },
+            h("h2", {}, _("Second Internet line (WAN2)")),
+            h("div", { class: "vc-form" },
+                row(_("Connection type"), "wan2.mode", select("wan2.mode",
+                    [["dhcp", _("Automatic (DHCP)")], ["static", _("Static address")]], { rerender: true })),
+                wan2.mode === "static" ? [
+                    row(_("Address"), "wan2.address", input("wan2.address", { placeholder: "203.0.113.10" })),
+                    row(_("Prefix length"), "wan2.prefix", input("wan2.prefix", { type: "number", number: true, min: 1, max: 32 })),
+                    row(_("Gateway"), "wan2.gateway", input("wan2.gateway", { placeholder: "203.0.113.1" })),
+                    row(_("DNS servers"), "wan2.dns", input("wan2.dns", { list: true, placeholder: "1.1.1.1 9.9.9.9" }), _("Separate several servers with spaces.")),
+                ] : null,
+                row(_("VLAN"), "wan2.vlan", input("wan2.vlan", { type: "number", number: true, min: 0, max: 4094 }), _("0 = none.")),
+                row(_("MTU"), "wan2.mtu", input("wan2.mtu", { type: "number", number: true, min: 0, max: 9000 }), _("0 = automatic")),
+                row(_("Use of the two lines"), "multiwan.mode", select("multiwan.mode", [
+                    ["failover", _("Main line first, the second one if it fails")],
+                    ["balance", _("Both together: each connection uses one of them")],
+                ], { rerender: true }), _("A single download never goes faster than one line; many connections together do.")),
+                c.multiwan.mode === "balance" ? [
+                    row(_("Share of the main line"), "multiwan.weight1", input("multiwan.weight1", { type: "number", number: true, min: 1, max: 10 })),
+                    row(_("Share of the second line"), "multiwan.weight2", input("multiwan.weight2", { type: "number", number: true, min: 1, max: 10 }), _("For example 3 and 1: three connections out of four on the main line.")),
+                ] : null)) : null,
+        h("div", { class: "vc-card" },
+            h("h2", {}, _("Backup Internet (USB hotspot)")),
+            h("div", { class: "vc-form" },
+                row("", "backup.enabled", checkbox("backup.enabled", _("Use the USB hotspot when the main line has no Internet"), true)),
+                c.backup.enabled ? [
+                    row(_("Monthly limit (GB)"), "backup.quota_gb", input("backup.quota_gb", { type: "number", number: true, min: 1, max: 10000 }),
+                        _("The hotspot is switched off at this limit until the next period. Everything counts, router included.")),
+                    row(_("Resets on day"), "backup.reset_day", input("backup.reset_day", { type: "number", number: true, min: 1, max: 28 })),
+                ] : null)),
         h("div", { class: "vc-card" },
             h("h2", {}, _("Local network (LAN)")),
             h("div", { class: "vc-form" },
@@ -870,6 +1024,19 @@ function viewWifi() {
                 Object.assign(input("wifi.psk", { type: S.showPsk ? "text" : "password" }), { className: "vc-grow" }),
                 h("button", { class: "vc-btn link", onclick: () => { S.showPsk = !S.showPsk; renderBody() } }, S.showPsk ? _("Hide") : _("Show"))))
                 : row(_("Organization"), "wifi.org", input("wifi.org"), _("Name used in the security certificate.")))));
+    if (w.band === "5") {
+        const usb = S.channels.usb && S.channels.usb.length ? S.channels.usb : FALLBACK_CHANNELS[2].slice(0, 11);
+        const w2 = S.cfg.wifi2;
+        out.push(h("div", { class: "vc-card" },
+            h("h2", {}, _("2.4 GHz radio (USB adapter)")),
+            st && st.radio2 && !st.radio2.present
+                ? h("div", { class: "vc-alert info" }, _("No USB Wi-Fi adapter found. It needs an adapter with the MediaTek MT7601U chip.")) : null,
+            h("div", { class: "vc-form" },
+                row("", "wifi2.enabled", checkbox("wifi2.enabled", _("Also on 2.4 GHz")),
+                    _("Same name and security as above: devices see a single network and pick the band themselves.")),
+                row(_("Channel"), "wifi2.channel", select("wifi2.channel", usb.map(c => [c, String(c)]), { number: true })),
+                row(_("Channel width"), "wifi2.width", select("wifi2.width", [[40, "40 MHz"], [20, "20 MHz"]], { number: true })))));
+    }
     if (w.security === "enterprise" && S.saved.wifi.security === "enterprise") {
         out.push(viewUsers(st));
         out.push(viewConnect());
